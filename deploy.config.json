@@ -1,6 +1,6 @@
 {
     "_note":  "Fill productionUrl and previewUrlTemplate after importing this repo into Vercel (dashboard OAuth). {branch} is replaced with the pushed branch name. Leave a URL blank to skip the health check.",
     "productionBranch":  "main",
-    "productionUrl":  "https://ostinato.vercel.app/",
+    "productionUrl":  "https://ostinato-phi.vercel.app/",
     "previewUrlTemplate":  "https://ostinato-git-{branch}-3ya3kis-projects.vercel.app/"
 }

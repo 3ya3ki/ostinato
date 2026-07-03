@@ -4,7 +4,7 @@
 
 円環シーケンサー弾幕ゲーム。敵はいない。弾は全部「過去の自分」。
 
-▶ Play: https://ostinato.vercel.app/
+▶ Play: https://ostinato-phi.vercel.app/
 
 ## 特徴
 
