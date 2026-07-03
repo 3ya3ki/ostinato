@@ -1,1 +1,2300 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><title>ostinato</title></head><body><h1>ostinato</h1></body></html>
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>OSTINATO — 避けた軌跡が、一曲になる</title>
+<meta name="description" content="あなたの回避がそのまま作曲になり、その曲が次の周回で弾幕になって襲ってくる。死んだ瞬間、あなたの一曲が完成する。円環シーケンサー弾幕ゲーム（1プレイ1〜3分・音アリ推奨）。">
+<meta property="og:title" content="OSTINATO — 避けた軌跡が、一曲になる">
+<meta property="og:description" content="回避が作曲になり、その曲が次の周回の弾幕になる。死んだ瞬間、一曲が完成する。">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://ostinato.vercel.app/">
+<meta name="twitter:card" content="summary">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='32' r='30' fill='%2306040f'/><circle cx='32' cy='32' r='22' fill='none' stroke='%238c78dc' stroke-width='2.5' opacity='.65'/><circle cx='32' cy='32' r='13' fill='none' stroke='%23ffd76a' stroke-width='2.5' opacity='.85'/><line x1='32' y1='32' x2='50' y2='14' stroke='%23efe9ff' stroke-width='2.5' opacity='.9'/><circle cx='47' cy='19' r='4.5' fill='%23ffd76a'/></svg>">
+<style>
+  html,body{margin:0;padding:0;height:100%;background:#04030a;overflow:hidden;}
+  #game{display:block;width:100vw;height:100vh;cursor:none;touch-action:none;}
+  #tuner{position:fixed;top:10px;right:10px;width:300px;max-height:86vh;overflow:auto;
+    background:rgba(8,6,24,.93);border:1px solid rgba(140,120,255,.35);border-radius:8px;
+    color:#cfc8ff;font:12px/1.7 ui-monospace,Consolas,monospace;padding:10px 12px;z-index:10;}
+  #tuner h3{margin:0 0 6px;font-size:12px;letter-spacing:.25em;color:#efe9ff;}
+  #tuner .row{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:1px 0;}
+  #tuner label{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  #tuner input{width:86px;background:#141031;color:#efe9ff;border:1px solid rgba(140,120,255,.4);
+    border-radius:4px;font:11px ui-monospace,monospace;padding:1px 4px;}
+  #tuner .stat{color:#8f86c9;margin-top:6px;border-top:1px solid rgba(140,120,255,.25);padding-top:4px;}
+  [hidden]{display:none !important;}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="tuner" hidden></div>
+<script>
+'use strict';
+/* =====================================================================
+ * OSTINATO v1
+ * あなたの回避がそのまま作曲になり、その曲が次の周回で弾幕になる。
+ *
+ * Single file / Vanilla JS / Canvas 2D procedural gfx / WebAudio synth.
+ *
+ * Layout:
+ *   [A] CONFIG + URL parameter overrides
+ *   [B] Utilities (math, format, PRNG)
+ *   [C] Pure logic — no canvas / no audio dependencies:
+ *         pitch mapping, NoteField, Bank (press-your-luck score),
+ *         StepTimeline (musical time SSOT), ring speed, collision
+ *   [D] AudioEngine — WebAudio full synthesis + lookahead scheduler sink
+ *   [E] Renderer — Canvas 2D, additive neon, particle pool
+ *   [F] Game core — states, input, lookahead-driven visual queue, juice
+ *   [G] Boot / DOM wiring / tuner panel / exports
+ *
+ * Testability: createGame(env) takes every platform dependency
+ * (canvas, createCanvas, AudioCtx, storage) via `env`, so a headless
+ * harness can stub them and drive update()/render() manually.
+ * =================================================================== */
+
+/* =====================================================================
+ * [A] CONFIG
+ * =================================================================== */
+const CONFIG = {
+  // --- stage ------------------------------------------------------
+  ARENA_R:          0.45,   // arena radius as fraction of min(canvasW,H)
+  INNER_DEAD_R:     0.18,   // same basis; below this: no score, low band
+  // --- sequencer --------------------------------------------------
+  REV_PERIOD_START: 8.0,    // seconds / revolution (loop 1)
+  REV_PERIOD_DECAY: 0.96,   // multiplied per revolution
+  REV_PERIOD_MIN:   3.2,    // floor
+  STEPS_PER_REV:    16,     // 16th notes
+  NOTE_LIFETIME:    4,      // revolutions; volume *0.65^age echo decay
+  PITCH_BANDS:      10,     // pentatonic, 2 octaves
+  // --- rings ------------------------------------------------------
+  RING_SPEED_BASE:  55,     // px/s (was 70: first-arm wavefronts must not sweep the whole board in one rev)
+  RING_SPEED_PITCH: 8,      // px/s per pitch band (was 10, same reason)
+  RING_SPEED_LOOP:  0.03,   // *(1 + k*runLoop)
+  RING_SPEED_LOOP_MAX: 2.0, // cap of the loop multiplier
+  RING_BAND:        6,      // px collision band thickness
+  LOOP2_ONBOARD:    0.6,    // ring speed factor on the first armed loop (ramps 0.6/0.8/1.0)
+  MAX_RINGS:        128,    // pool; steady-state live rings reach 70-100 late game
+  // --- player -----------------------------------------------------
+  PLAYER_HITBOX_R:  4,      // px (visual comet is ~8px)
+  PLAYER_EASE:      0.15,   // lerp per frame @60fps (framerate-corrected)
+  PLAYER_KB_SPEED:  350,    // px/s keyboard target velocity
+  TOUCH_OFFSET:     40,     // px above finger
+  // --- score (maturity bank, G2) ----------------------------------
+  SCORE_PITCH_MULT: 10,     // perFire = band * this
+  SCORE_MIN_BAND:   2,      // band < 2 scores 0
+  MATURE_MULT:      2,      // pending *2 on 4th fire (maturity)
+  // --- onboarding / audio -----------------------------------------
+  GHOST_CUE_COUNT:  8,      // causal-ghost cues per run
+  GHOST_LEAD:       0.3,    // seconds before the fire
+  DUCK_DEPTH:       0.4,    // sidechain duck target gain
+  DUCK_ATTACK:      0.03,   // 30ms
+  DUCK_RELEASE:     0.15,   // 150ms
+  LOOKAHEAD_MS:     120,    // audio lookahead horizon
+  TICK_MS:          25,     // scheduler tick
+  ROOT_HZ:          110,    // A2
+  MASTER_GAIN:      0.8,
+  // --- juice ------------------------------------------------------
+  HITSTOP_MS:       120,
+  RGB_FRAMES:       3,      // chromatic offset frames per fire
+  RGB_OFFSET_PX:    2.5,
+  ZOOM_PULSE:       0.0035, // zoom pulse amplitude (~1.5-2px at the arena rim, brief §6)
+  SHAKE_PX:         2,      // micro-shake on beat-head fires
+  HUE_START:        230,    // navy
+  HUE_MID:          280,    // violet
+  HUE_END:          405,    // gold (360+45)
+  HUE_MID_LOOP:     6,
+  HUE_END_LOOP:     14,
+  MAX_PARTICLES:    512,
+  TRAIL_LEN:        12,     // comet trail points
+  // --- physics ----------------------------------------------------
+  PHYS_DT:          1 / 120, // fixed timestep
+  // --- result -----------------------------------------------------
+  REQUIEM_GAIN:     0.55,
+};
+
+/* URL parameter overrides: exact keys (case-insensitive) + short aliases.
+ * e.g. ?rev=6&decay=0.94&RING_SPEED_BASE=90                            */
+const CONFIG_ALIASES = {
+  rev: 'REV_PERIOD_START', decay: 'REV_PERIOD_DECAY', min: 'REV_PERIOD_MIN',
+  life: 'NOTE_LIFETIME',   bands: 'PITCH_BANDS',
+  ring: 'RING_SPEED_BASE', ringp: 'RING_SPEED_PITCH', ringl: 'RING_SPEED_LOOP',
+  band: 'RING_BAND',       onboard: 'LOOP2_ONBOARD',
+  hitbox: 'PLAYER_HITBOX_R', ease: 'PLAYER_EASE',
+  mult: 'MATURE_MULT',     ghost: 'GHOST_CUE_COUNT',
+  duck: 'DUCK_DEPTH',      look: 'LOOKAHEAD_MS',
+};
+
+function applyConfigOverrides(cfg, search) {
+  if (!search) return cfg;
+  let params;
+  try { params = new URLSearchParams(search); } catch (e) { return cfg; }
+  const keyMap = {};
+  for (const k of Object.keys(cfg)) keyMap[k.toLowerCase()] = k;
+  params.forEach((v, k) => {
+    const key = CONFIG_ALIASES[k.toLowerCase()] || keyMap[k.toLowerCase()];
+    if (!key || typeof cfg[key] !== 'number') return;
+    const num = parseFloat(v);
+    if (Number.isFinite(num)) cfg[key] = num;
+  });
+  return sanitizeConfig(cfg);
+}
+
+/* Range sanitize. URL params / tuner accept any finite number; 0, negative
+ * or out-of-range values here NaN-poison WebAudio params (e.g. ?bands=0 ->
+ * pentaFreq(-1) -> setTargetAtTime(NaN) throws and kills the rAF loop). */
+function sanitizeConfig(cfg) {
+  const int1 = k => { cfg[k] = Math.max(1, Math.round(cfg[k])); };
+  int1('STEPS_PER_REV'); int1('PITCH_BANDS'); int1('NOTE_LIFETIME');
+  int1('MAX_RINGS'); int1('MAX_PARTICLES'); /* ?MAX_RINGS=0 -> empty pool -> spawnRing null deref */
+  cfg.PHYS_DT = Math.min(0.1, Math.max(1 / 1000, cfg.PHYS_DT));
+  cfg.GHOST_CUE_COUNT = Math.max(0, Math.round(cfg.GHOST_CUE_COUNT));
+  cfg.ARENA_R = Math.max(0.05, cfg.ARENA_R);
+  cfg.INNER_DEAD_R = Math.min(Math.max(0, cfg.INNER_DEAD_R), cfg.ARENA_R * 0.9);
+  cfg.REV_PERIOD_START = Math.max(0.5, cfg.REV_PERIOD_START);
+  cfg.REV_PERIOD_MIN = Math.max(0.5, cfg.REV_PERIOD_MIN);
+  cfg.REV_PERIOD_DECAY = Math.min(1, Math.max(0.5, cfg.REV_PERIOD_DECAY));
+  cfg.PLAYER_EASE = Math.min(0.99, Math.max(0.01, cfg.PLAYER_EASE));
+  cfg.LOOKAHEAD_MS = Math.max(10, cfg.LOOKAHEAD_MS);
+  cfg.TICK_MS = Math.max(5, cfg.TICK_MS);
+  return cfg;
+}
+
+/* =====================================================================
+ * [B] Utilities
+ * =================================================================== */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => v < a ? a : (v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+/* framerate-independent lerp factor: `ease` defined per 60fps frame */
+const easeFactor = (ease, dt) => 1 - Math.pow(1 - ease, dt * 60);
+const fmtNum = n => {
+  n = Math.round(n);
+  const neg = n < 0; n = Math.abs(n);
+  let s = String(n), out = '';
+  while (s.length > 3) { out = ',' + s.slice(-3) + out; s = s.slice(0, -3); }
+  return (neg ? '-' : '') + s + out;
+};
+/* deterministic PRNG for cosmetic randomness (particles, noise dressing) */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const cosmRand = mulberry32(0x05714470);
+
+/* hue for a pitch band: cold (low) -> warm (high) */
+const bandHue = (band, bands) => lerp(210, 38, band / Math.max(1, bands - 1));
+/* background hue drift across the run: navy -> violet -> gold */
+function runHue(runLoop, cfg) {
+  if (runLoop <= cfg.HUE_MID_LOOP) {
+    return lerp(cfg.HUE_START, cfg.HUE_MID, clamp(runLoop / cfg.HUE_MID_LOOP, 0, 1));
+  }
+  const t = clamp((runLoop - cfg.HUE_MID_LOOP) / (cfg.HUE_END_LOOP - cfg.HUE_MID_LOOP), 0, 1);
+  return lerp(cfg.HUE_MID, cfg.HUE_END, t) % 360;
+}
+
+/* =====================================================================
+ * [C] Pure logic — deliberately free of canvas / audio dependencies.
+ *     Everything here is unit-testable with plain numbers.
+ * =================================================================== */
+
+/* ---- pitch mapping (§4 音高マッピング) ------------------------------
+ * Radii normalized to arena radius (rn in [0,1]).
+ * innerN = INNER_DEAD_R / ARENA_R. u=(rn-innerN)/(1-innerN) -> band 0..9 */
+function innerNorm(cfg) { return cfg.INNER_DEAD_R / cfg.ARENA_R; }
+
+function bandFromRadius(rn, cfg) {
+  const inN = innerNorm(cfg);
+  const u = clamp((rn - inN) / (1 - inN), 0, 0.9999);
+  return clamp(Math.floor(u * cfg.PITCH_BANDS), 0, cfg.PITCH_BANDS - 1);
+}
+
+/* center radius (normalized) of a band — seeds snap here (quantized) */
+function bandRadiusNorm(band, cfg) {
+  const inN = innerNorm(cfg);
+  return inN + ((band + 0.5) / cfg.PITCH_BANDS) * (1 - inN);
+}
+
+/* A minor pentatonic, 2 octaves: degrees [0,3,5,7,10] semitones */
+const PENTA_DEGREES = [0, 3, 5, 7, 10];
+function pentaFreq(band, rootHz) {
+  const oct = Math.floor(band / 5);
+  const st = PENTA_DEGREES[band % 5] + 12 * oct;
+  return rootHz * Math.pow(2, st / 12);
+}
+
+function scorePerFire(band, cfg) {
+  return band < cfg.SCORE_MIN_BAND ? 0 : band * cfg.SCORE_PITCH_MULT;
+}
+
+function ringSpeedFor(band, runLoop, cfg, onboard) {
+  const m = Math.min(1 + cfg.RING_SPEED_LOOP * Math.max(0, runLoop), cfg.RING_SPEED_LOOP_MAX);
+  return (cfg.RING_SPEED_BASE + cfg.RING_SPEED_PITCH * band) * m * (onboard || 1);
+}
+
+/* annulus-band collision (§4 当たり判定) — positions in px */
+function ringHits(px, py, ring, hitR, bandW) {
+  const dx = px - ring.x, dy = py - ring.y;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  return Math.abs(d - ring.r) < bandW / 2 + hitR;
+}
+
+/* ---- NoteField ------------------------------------------------------
+ * 16 step slots, each holding up to NOTE_LIFETIME notes (loop-staggered).
+ * A note planted on loop L fires on loops L+1..L+4; the 4th fire is
+ * maturity (removed, pending banked *2). Alive notes <= 16*4 = 64.     */
+let __noteId = 1;
+class NoteField {
+  constructor(cfg) {
+    this.cfg = cfg;
+    this.slots = [];
+    for (let i = 0; i < cfg.STEPS_PER_REV; i++) this.slots.push([]);
+  }
+  plant(step, band, loop, ghost) {
+    const note = {
+      id: __noteId++, step, band, loop,
+      fires: 0, pending: 0, dead: false,
+      ghost: ghost || null, ghostCued: false,
+      bornT: 0, firedFlash: 0,
+    };
+    const arr = this.slots[step];
+    arr.push(note);
+    while (arr.length > this.cfg.NOTE_LIFETIME) arr.shift().dead = true;
+    return note;
+  }
+  /* Notes that WILL fire when the head passes `step` on `loop`
+   * (read-only; used by the ghost-cue pre-pass).                   */
+  peekFires(step, loop) {
+    const out = [];
+    for (const n of this.slots[step]) {
+      const age = loop - n.loop;
+      if (!n.dead && age >= 1 && age <= this.cfg.NOTE_LIFETIME) out.push(n);
+    }
+    return out;
+  }
+  /* Commit fires for (step, loop). Mutates fires/pending, removes
+   * matured notes. Returns fire descriptors.                       */
+  collectFires(step, loop) {
+    const cfg = this.cfg, arr = this.slots[step], out = [];
+    for (const n of arr) {
+      const age = loop - n.loop;
+      if (n.dead || age < 1 || age > cfg.NOTE_LIFETIME) continue;
+      n.fires++;
+      const per = scorePerFire(n.band, cfg);
+      n.pending += per;
+      const matured = n.fires >= cfg.NOTE_LIFETIME;
+      if (matured) n.dead = true;
+      out.push({ note: n, per, matured, age });
+    }
+    if (out.some(f => f.matured)) {
+      this.slots[step] = arr.filter(n => !n.dead);
+    }
+    return out;
+  }
+  alive() {
+    const out = [];
+    for (const arr of this.slots) for (const n of arr) if (!n.dead) out.push(n);
+    return out;
+  }
+  count() {
+    let c = 0;
+    for (const arr of this.slots) c += arr.length;
+    return c;
+  }
+  clear() {
+    for (let i = 0; i < this.slots.length; i++) this.slots[i].length = 0;
+  }
+}
+
+/* ---- Bank (G2 press-your-luck score) ------------------------------ */
+class Bank {
+  constructor(cfg) {
+    this.cfg = cfg;
+    this.banked = 0;    // confirmed score
+    this.pending = 0;   // at-risk score
+    this.lost = 0;      // pending destroyed at death
+    this.fires = 0;     // total fire count (stats)
+    this.matured = 0;   // matured note count (stats)
+  }
+  onFire(per) { this.pending += per; this.fires++; }
+  onMature(note) {
+    const gain = note.pending * this.cfg.MATURE_MULT;
+    this.pending -= note.pending;
+    if (this.pending < 0) this.pending = 0;
+    this.banked += gain;
+    this.matured++;
+    return gain;
+  }
+  onDeath() { this.lost = this.pending; this.pending = 0; }
+}
+
+/* ---- StepTimeline ---------------------------------------------------
+ * The single source of musical truth. Committed pointer advances with
+ * the lookahead horizon (advanceUntil); peek() previews further steps
+ * without mutation (ghost cues); headAt() maps wall/music time back to
+ * a continuous head angle for rendering & recording.                  */
+class StepTimeline {
+  constructor(cfg, startTime, startPeriod) {
+    this.cfg = cfg;
+    this.loop = 0;
+    this.step = 0;
+    this.period = startPeriod || cfg.REV_PERIOD_START;
+    this.nextTime = startTime;
+    this.boundaries = [{ time: startTime, loop: 0, period: this.period }];
+    /* true: tempo decay suspended (attract/title idling must not
+     * pre-decay the period before recording begins)                */
+    this.decayHold = false;
+  }
+  advanceUntil(t, cb) {
+    const cfg = this.cfg;
+    let guard = 0;
+    while (this.nextTime < t && guard++ < 4096) {
+      cb({ time: this.nextTime, step: this.step, loop: this.loop, period: this.period });
+      this.nextTime += this.period / cfg.STEPS_PER_REV;
+      this.step++;
+      if (this.step >= cfg.STEPS_PER_REV) {
+        this.step = 0;
+        this.loop++;
+        if (!this.decayHold) {
+          this.period = Math.max(cfg.REV_PERIOD_MIN, this.period * cfg.REV_PERIOD_DECAY);
+        }
+        this.boundaries.push({ time: this.nextTime, loop: this.loop, period: this.period });
+        if (this.boundaries.length > 12) this.boundaries.shift();
+      }
+    }
+  }
+  /* preview events in [committed pointer, t) without mutating */
+  peek(t) {
+    const cfg = this.cfg, out = [];
+    let step = this.step, loop = this.loop, period = this.period, nt = this.nextTime;
+    let guard = 0;
+    while (nt < t && guard++ < 256) {
+      out.push({ time: nt, step, loop, period });
+      nt += period / cfg.STEPS_PER_REV;
+      step++;
+      if (step >= cfg.STEPS_PER_REV) {
+        step = 0; loop++;
+        if (!this.decayHold) {
+          period = Math.max(cfg.REV_PERIOD_MIN, period * cfg.REV_PERIOD_DECAY);
+        }
+      }
+    }
+    return out;
+  }
+  /* continuous head state at music-time t (t <= committed horizon) */
+  headAt(t) {
+    const bs = this.boundaries;
+    let b = bs[0];
+    for (let i = bs.length - 1; i >= 0; i--) {
+      if (bs[i].time <= t) { b = bs[i]; break; }
+    }
+    const phase = clamp((t - b.time) / b.period, 0, 0.99999);
+    return { loop: b.loop, phase, period: b.period };
+  }
+}
+
+/* =====================================================================
+ * [D] Audio — MusicClock + AudioEngine (WebAudio full synthesis)
+ * =================================================================== */
+
+/* MusicClock: unified music time `t`. Before the AudioContext is
+ * unlocked, t advances with rAF dt; once running, t locks rigidly to
+ * ctx.currentTime + offset so scheduled audio and visuals share one
+ * timeline (the lookahead scheduler runs on this clock).             */
+class MusicClock {
+  constructor() { this.t = 0; this.actx = null; this.offset = null; }
+  attach(actx) { this.actx = actx; }
+  calibrate() { if (this.actx) this.offset = this.t - this.actx.currentTime; }
+  advance(dt) {
+    if (this.offset != null && this.actx && this.actx.state === 'running') {
+      this.t = this.actx.currentTime + this.offset;
+    } else {
+      this.t += dt;
+    }
+  }
+  /* music time -> AudioContext time (null if audio unavailable) */
+  toCtx(t) { return this.offset == null ? null : t - this.offset; }
+}
+
+class AudioEngine {
+  constructor(env, cfg, clock) {
+    this.env = env;
+    this.cfg = cfg;
+    this.clock = clock;
+    this.ctx = null;
+    this.unlocked = false;
+    this.layers = { pluck: false, bass: false, pad: false, hat16: false, kick: false };
+    this._padOn = false;
+    this._pluckPool = [];
+    this._pluckIdx = 0;
+  }
+
+  init() {
+    if (this.ctx) return;
+    const AC = this.env.AudioCtx;
+    if (!AC) return;
+    try { this.ctx = new AC(); } catch (e) { this.ctx = null; return; }
+    this.clock.attach(this.ctx);
+    this._build();
+    if (this.ctx.state === 'running') this._markUnlocked();
+  }
+
+  _markUnlocked() {
+    if (this.unlocked) return;
+    this.unlocked = true;
+    this.clock.calibrate();
+    this._startBed();
+  }
+
+  tryUnlock() {
+    if (!this.ctx) this.init();
+    if (!this.ctx) return;
+    if (this.ctx.state === 'running') { this._markUnlocked(); return; }
+    const p = this.ctx.resume && this.ctx.resume();
+    if (p && p.then) p.then(() => this._markUnlocked()).catch(() => {});
+  }
+
+  suspend() {
+    if (this.ctx && this.ctx.state === 'running' && this.ctx.suspend) {
+      try { this.ctx.suspend(); } catch (e) {}
+    }
+  }
+  resume() {
+    if (!this.ctx) return;
+    const p = this.ctx.resume && this.ctx.resume();
+    if (p && p.then) p.then(() => { this.clock.calibrate(); }).catch(() => {});
+  }
+
+  /* ---- graph ------------------------------------------------------ */
+  _build() {
+    const ctx = this.ctx, cfg = this.cfg;
+    this.master = ctx.createGain();
+    this.master.gain.value = cfg.MASTER_GAIN;
+    let sink = ctx.destination;
+    if (ctx.createDynamicsCompressor) {
+      this.comp = ctx.createDynamicsCompressor();
+      this.comp.connect(ctx.destination);
+      sink = this.comp;
+    }
+    this.master.connect(sink);
+
+    /* sidechain-ducked bus: drone + pad live here (G3) */
+    this.duckBus = ctx.createGain();
+    this.duckBus.gain.value = 1;
+    this.duckBus.connect(this.master);
+
+    /* synthetic-IR convolver reverb (requiem + subtle global send) */
+    this.reverb = ctx.createConvolver();
+    this.reverb.buffer = this._buildIR(2.0);
+    this.revGain = ctx.createGain();
+    this.revGain.gain.value = 0.35;
+    this.reverb.connect(this.revGain);
+    this.revGain.connect(this.master);
+
+    this.noiseBuf = this._buildNoise(1.0);
+    this.burstBuf = this._buildNoise(0.03);
+
+    /* pluck voice pool — chains reused, only BufferSources are one-shot */
+    for (let i = 0; i < 24; i++) this._pluckPool.push(this._makePluckVoice());
+  }
+
+  _buildNoise(seconds) {
+    const ctx = this.ctx;
+    const len = Math.max(1, Math.floor(ctx.sampleRate * seconds));
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    return buf;
+  }
+
+  /* 2s exponentially decaying stereo noise = synthetic impulse response */
+  _buildIR(seconds) {
+    const ctx = this.ctx;
+    const len = Math.max(1, Math.floor(ctx.sampleRate * seconds));
+    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const d = buf.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.8);
+      }
+    }
+    return buf;
+  }
+
+  /* Karplus-Strong-ish voice: burst -> input -> delay loop(lp+fb) -> out */
+  _makePluckVoice() {
+    const ctx = this.ctx;
+    const input = ctx.createGain(); input.gain.value = 1;
+    const delay = ctx.createDelay(0.1);
+    const fb = ctx.createGain(); fb.gain.value = 0;
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 3000;
+    /* WebAudio lowpass Q is in dB; the default (+1dB = linear 1.12) puts a
+     * x1.25 resonance peak near the cutoff, so the loop gain fb*|H| hit
+     * 1.08 > 1 = self-oscillating howl (R2-1, proof: test/ks-stability.js).
+     * -6dB removes the peak entirely: |H| <= 1 at every frequency.        */
+    lp.Q.value = -6;
+    const out = ctx.createGain(); out.gain.value = 0;
+    input.connect(delay);
+    delay.connect(lp);
+    lp.connect(fb);
+    fb.connect(delay);
+    delay.connect(out);
+    out.connect(this.master);
+    const wet = ctx.createGain(); wet.gain.value = 0;
+    out.connect(wet);
+    wet.connect(this.reverb);
+    return { input, delay, fb, lp, out, wet };
+  }
+
+  /* ---- continuous bed (drone / theremin) --------------------------- */
+  _startBed() {
+    const ctx = this.ctx, cfg = this.cfg;
+    if (this._bedOn) return;
+    this._bedOn = true;
+    const t0 = ctx.currentTime;
+
+    /* drone: 2 detuned oscillators + slow LFO on a lowpass */
+    this.droneFilter = ctx.createBiquadFilter();
+    this.droneFilter.type = 'lowpass';
+    this.droneFilter.frequency.value = 320;
+    this.droneFilter.Q.value = 1.2;
+    this.droneGain = ctx.createGain();
+    this.droneGain.gain.value = 0;
+    this.droneGain.gain.setTargetAtTime(0.11, t0, 1.2);
+    this.droneFilter.connect(this.droneGain);
+    this.droneGain.connect(this.duckBus);
+    const mk = (detune) => {
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = cfg.ROOT_HZ / 2; /* A1 */
+      if (o.detune) o.detune.value = detune;
+      o.connect(this.droneFilter);
+      o.start(t0);
+      return o;
+    };
+    this.droneOscs = [mk(-7), mk(+7)];
+    const lfo = ctx.createOscillator();
+    lfo.type = 'sine'; lfo.frequency.value = 0.07;
+    const lfoGain = ctx.createGain(); lfoGain.gain.value = 180;
+    lfo.connect(lfoGain);
+    lfoGain.connect(this.droneFilter.frequency);
+    lfo.start(t0);
+    this.droneLfo = lfo;
+
+    /* theremin: always-on sine tracking the player's radius band */
+    this.thOsc = ctx.createOscillator();
+    this.thOsc.type = 'sine';
+    this.thOsc.frequency.value = cfg.ROOT_HZ * 2;
+    this.thGain = ctx.createGain();
+    this.thGain.gain.value = 0;
+    this.thOsc.connect(this.thGain);
+    this.thGain.connect(this.master);
+    this.thOsc.start(t0);
+  }
+
+  setTheremin(freq, level) {
+    if (!this.unlocked || !this.thOsc) return;
+    const t = this.ctx.currentTime;
+    this.thOsc.frequency.setTargetAtTime(freq, t, 0.035);
+    this.thGain.gain.setTargetAtTime(level * 0.055, t, 0.06);
+  }
+
+  /* pad appears at L6 */
+  enablePad() {
+    if (this._padOn || !this.unlocked) return;
+    this._padOn = true;
+    const ctx = this.ctx, cfg = this.cfg, t0 = ctx.currentTime;
+    this.padGain = this.ctx.createGain();
+    this.padGain.gain.value = 0;
+    this.padGain.gain.setTargetAtTime(0.05, t0, 2.5);
+    this.padGain.connect(this.duckBus);
+    const freqs = [cfg.ROOT_HZ * 2, cfg.ROOT_HZ * 3, cfg.ROOT_HZ * 2 * Math.pow(2, 3 / 12)];
+    this.padOscs = freqs.map((f, i) => {
+      const o = ctx.createOscillator();
+      o.type = 'triangle';
+      o.frequency.value = f;
+      if (o.detune) o.detune.value = (i - 1) * 6;
+      o.connect(this.padGain);
+      o.start(t0);
+      return o;
+    });
+  }
+
+  /* pad is per-run (§5 layer unlock lever); a restart must re-lock it */
+  disablePad() {
+    if (!this._padOn) return;
+    this._padOn = false;
+    const pg = this.padGain, oscs = this.padOscs;
+    this.padGain = null; this.padOscs = null;
+    if (!this.ctx || !pg || !oscs) return;
+    const t = this.ctx.currentTime;
+    try {
+      pg.gain.cancelScheduledValues(t);
+      pg.gain.setTargetAtTime(0, t, 0.12);
+      oscs.forEach((o, i) => {
+        o.stop(t + 0.8);
+        if (i === 0) o.onended = () => { try { pg.disconnect(); } catch (e) {} };
+      });
+    } catch (e) {}
+  }
+
+  /* ---- one-shots (scheduled at music-time t) ----------------------- */
+  _at(t) {
+    const ct = this.clock.toCtx(t);
+    if (ct == null || !this.ctx) return null;
+    return Math.max(ct, this.ctx.currentTime + 0.003);
+  }
+
+  /* note fire pluck. age 1 = fresh, 4 = last echo */
+  pluck(t, band, age, accent, wetAmt) {
+    if (!this.unlocked) return;
+    const at = this._at(t); if (at == null) return;
+    const cfg = this.cfg;
+    const f = pentaFreq(band, cfg.ROOT_HZ);
+    const v = this._pluckPool[this._pluckIdx++ % this._pluckPool.length];
+    const dt = 1 / f;
+    const decay = Math.pow(0.65, Math.max(0, age - 1));
+    v.delay.delayTime.setValueAtTime(Math.min(0.099, dt), at);
+    v.fb.gain.cancelScheduledValues(at);
+    /* stability invariant (R2-1): fb * max|H_lp| < 1, and fb is released
+     * to 0 after the ring so no voice can sustain past ~1.3s regardless
+     * of parameter drift. Verified: test/ks-stability.js
+     * (age >= 1 at every call site, so fb <= 0.82 by construction; the
+     * Math.min is defense-in-depth for future call paths, not load-
+     * bearing for the invariant)                                       */
+    v.fb.gain.setValueAtTime(Math.min(0.82, 0.86 - 0.04 * age), at);
+    v.fb.gain.setTargetAtTime(0, at + 0.9, 0.18);
+    v.lp.frequency.setValueAtTime(Math.min(8000, 1400 + 500 * band * decay), at);
+    const g = 0.5 * decay * (accent ? 1.45 : 1);
+    v.out.gain.cancelScheduledValues(at);
+    v.out.gain.setValueAtTime(g, at);
+    v.out.gain.setTargetAtTime(0, at + 0.35, 0.5);
+    v.wet.gain.setValueAtTime(wetAmt != null ? wetAmt : 0.18 + 0.1 * age, at);
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.burstBuf;
+    src.connect(v.input);
+    src.start(at);
+    src.stop(at + 0.03);
+  }
+
+  hat(t, accent) {
+    if (!this.unlocked) return;
+    const at = this._at(t); if (at == null) return;
+    const ctx = this.ctx;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuf;
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass'; hp.frequency.value = 7500;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(accent ? 0.16 : 0.09, at);
+    g.gain.exponentialRampToValueAtTime(0.001, at + 0.03);
+    src.connect(hp); hp.connect(g); g.connect(this.master);
+    src.start(at); src.stop(at + 0.035);
+  }
+
+  bass(t) {
+    if (!this.unlocked) return;
+    const at = this._at(t); if (at == null) return;
+    const ctx = this.ctx, cfg = this.cfg;
+    const o = ctx.createOscillator();
+    o.type = 'sine'; o.frequency.value = cfg.ROOT_HZ / 2;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, at);
+    g.gain.linearRampToValueAtTime(0.28, at + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.001, at + 0.3);
+    o.connect(g); g.connect(this.master);
+    o.start(at); o.stop(at + 0.32);
+  }
+
+  kick(t) {
+    if (!this.unlocked) return;
+    const at = this._at(t); if (at == null) return;
+    const ctx = this.ctx;
+    const o = ctx.createOscillator();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(140, at);
+    o.frequency.exponentialRampToValueAtTime(42, at + 0.11);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.55, at);
+    g.gain.exponentialRampToValueAtTime(0.001, at + 0.16);
+    o.connect(g); g.connect(this.master);
+    o.start(at); o.stop(at + 0.18);
+  }
+
+  /* maturity chime: short ascending pentatonic arpeggio */
+  chime(t, band) {
+    if (!this.unlocked) return;
+    const cfg = this.cfg;
+    for (let i = 0; i < 3; i++) {
+      const at = this._at(t + i * 0.06); if (at == null) return;
+      const b = Math.min(cfg.PITCH_BANDS - 1 + 3, band + 2 + i * 2);
+      const f = pentaFreq(b % 10, cfg.ROOT_HZ) * (b >= 10 ? 2 : 1) * 2;
+      const o = this.ctx.createOscillator();
+      o.type = 'sine'; o.frequency.value = f;
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, at);
+      g.gain.linearRampToValueAtTime(0.12, at + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.001, at + 0.28);
+      o.connect(g); g.connect(this.master);
+      g.connect(this.reverb);
+      o.start(at); o.stop(at + 0.3);
+    }
+  }
+
+  /* sidechain duck (G3): drone+pad bus dips to DUCK_DEPTH and recovers */
+  duck(t, depth) {
+    if (!this.unlocked || !this.duckBus) return;
+    const at = this._at(t); if (at == null) return;
+    const cfg = this.cfg, g = this.duckBus.gain;
+    const d = depth != null ? depth : cfg.DUCK_DEPTH;
+    g.cancelScheduledValues(at);
+    g.setValueAtTime(1, at);
+    g.linearRampToValueAtTime(d, at + cfg.DUCK_ATTACK);
+    g.linearRampToValueAtTime(1, at + cfg.DUCK_ATTACK + cfg.DUCK_RELEASE);
+  }
+
+  /* death: out-of-scale dissonant cluster, then silence */
+  deathCluster(t) {
+    if (!this.unlocked) return;
+    const at = this._at(t); if (at == null) return;
+    const ctx = this.ctx, cfg = this.cfg;
+    const ratios = [1, 1.059, 1.122, 1.334, 1.498];
+    for (const r of ratios) {
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.value = cfg.ROOT_HZ * 1.94 * r;
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.09, at);
+      g.gain.exponentialRampToValueAtTime(0.001, at + 0.55);
+      o.connect(g); g.connect(this.master);
+      o.start(at); o.stop(at + 0.6);
+    }
+    this.duck(t, 0.12);
+    /* pull the bed down for the requiem */
+    if (this.droneGain) this.droneGain.gain.setTargetAtTime(0.045, this._at(t + 0.4) || 0, 0.8);
+    if (this.thGain) this.thGain.gain.setTargetAtTime(0, this._at(t) || 0, 0.05);
+    if (this.padGain) this.padGain.gain.setTargetAtTime(0.012, this._at(t + 0.4) || 0, 0.8);
+  }
+
+  /* requiem pluck — reverb-heavy voice for the result loop */
+  requiemPluck(t, band, age) {
+    this.pluck(t, band, age, false, this.cfg.REQUIEM_GAIN + 0.25 * age);
+  }
+
+  restoreBed() {
+    if (!this.unlocked) return;
+    const t = this.ctx.currentTime;
+    if (this.droneGain) this.droneGain.gain.setTargetAtTime(0.11, t, 0.6);
+  }
+}
+
+/* =====================================================================
+ * [E] Renderer — Canvas 2D, additive neon, everything procedural
+ * =================================================================== */
+
+class ParticlePool {
+  constructor(max) {
+    this.max = max;
+    this.ps = new Array(max);
+    for (let i = 0; i < max; i++) {
+      this.ps[i] = { alive: false, x: 0, y: 0, vx: 0, vy: 0, life: 0, maxLife: 1,
+        size: 2, hue: 45, sat: 90, lit: 60, drag: 1, tx: null, ty: null, home: 0, onArrive: null };
+    }
+    this.cursor = 0;
+  }
+  spawn(o) {
+    let p = null;
+    for (let i = 0; i < this.max; i++) {
+      const c = this.ps[(this.cursor + i) % this.max];
+      if (!c.alive) { p = c; this.cursor = (this.cursor + i + 1) % this.max; break; }
+    }
+    if (!p) { p = this.ps[this.cursor]; this.cursor = (this.cursor + 1) % this.max; }
+    p.alive = true;
+    p.x = o.x; p.y = o.y;
+    p.vx = o.vx || 0; p.vy = o.vy || 0;
+    p.life = p.maxLife = o.life || 0.6;
+    p.size = o.size || 2;
+    p.hue = o.hue != null ? o.hue : 45;
+    p.sat = o.sat != null ? o.sat : 90;
+    p.lit = o.lit != null ? o.lit : 62;
+    p.drag = o.drag != null ? o.drag : 1;
+    p.tx = o.tx != null ? o.tx : null;
+    p.ty = o.ty != null ? o.ty : null;
+    p.home = o.home || 0;
+    p.onArrive = o.onArrive || null;
+    return p;
+  }
+  update(dt) {
+    for (const p of this.ps) {
+      if (!p.alive) continue;
+      if (p.tx != null) { /* homing (gold bank particles) */
+        const dx = p.tx - p.x, dy = p.ty - p.y;
+        const d = Math.sqrt(dx * dx + dy * dy) || 1;
+        p.vx += (dx / d) * p.home * dt;
+        p.vy += (dy / d) * p.home * dt;
+        if (d < 14) {
+          p.alive = false;
+          if (p.onArrive) p.onArrive();
+          continue;
+        }
+      }
+      const dr = Math.pow(p.drag, dt * 60);
+      p.vx *= dr; p.vy *= dr;
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.life -= dt;
+      if (p.life <= 0) {
+        p.alive = false;
+        if (p.tx != null && p.onArrive) p.onArrive();
+      }
+    }
+  }
+  clear() { for (const p of this.ps) p.alive = false; }
+}
+
+const UI_FONT = '"Segoe UI","Hiragino Sans","Yu Gothic UI",system-ui,sans-serif';
+
+class Renderer {
+  constructor(env) {
+    this.env = env;
+    this.canvas = env.canvas;
+    this.ctx = this.canvas.getContext('2d');
+    this.buf = env.createCanvas(2, 2);
+    this.bctx = this.buf.getContext('2d');
+    this.w = 2; this.h = 2; this.dpr = 1;
+    this.hasFilter = typeof this.ctx.filter === 'string';
+  }
+  resize(w, h, dpr) {
+    this.w = w; this.h = h; this.dpr = dpr;
+    this.canvas.width = Math.max(2, Math.round(w * dpr));
+    this.canvas.height = Math.max(2, Math.round(h * dpr));
+    this.buf.width = this.canvas.width;
+    this.buf.height = this.canvas.height;
+  }
+
+  stepAngle(step, cfg) { return (step / cfg.STEPS_PER_REV) * TAU - Math.PI / 2; }
+  notePos(note, g) {
+    const a = this.stepAngle(note.step, g.cfg);
+    const r = bandRadiusNorm(note.band, g.cfg) * g.view.R;
+    return { x: g.view.cx + Math.cos(a) * r, y: g.view.cy + Math.sin(a) * r };
+  }
+
+  render(g) {
+    const c = this.bctx, v = g.view, cfg = g.cfg;
+    c.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    c.globalCompositeOperation = 'source-over';
+    c.globalAlpha = 1;
+
+    /* --- background + vignette (hue drifts navy->violet->gold) --- */
+    const hue = g.hue;
+    c.fillStyle = 'hsl(' + hue + ',42%,3.6%)';
+    c.fillRect(0, 0, this.w, this.h);
+    const vg = c.createRadialGradient(v.cx, v.cy, v.R * 0.2, v.cx, v.cy, v.R * 1.6);
+    vg.addColorStop(0, 'hsla(' + hue + ',60%,14%,0.20)');
+    vg.addColorStop(1, 'hsla(' + hue + ',60%,2%,0.55)');
+    c.fillStyle = vg;
+    c.fillRect(0, 0, this.w, this.h);
+
+    c.globalCompositeOperation = 'lighter';
+
+    this.drawGrid(c, g, hue);
+    this.drawHead(c, g, hue);
+    this.drawSeeds(c, g);
+    this.drawRings(c, g);
+    this.drawStitches(c, g);
+    this.drawGhosts(c, g);
+    if (g.state !== 'result') this.drawPlayer(c, g);
+    this.drawParticles(c, g);
+    this.drawPopups(c, g);
+    if (g.title.active) this.drawTitle(c, g);
+    if (g.state === 'dying') this.drawCollapse(c, g);
+
+    /* --- composite buffer -> screen with juice ------------------- */
+    const x = this.ctx;
+    x.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    x.globalCompositeOperation = 'source-over';
+    x.globalAlpha = 1;
+    x.fillStyle = '#020108';
+    x.fillRect(0, 0, this.w, this.h);
+    const fx = g.fx;
+    const shx = fx.shake > 0 ? (cosmRand() * 2 - 1) * fx.shake : 0;
+    const shy = fx.shake > 0 ? (cosmRand() * 2 - 1) * fx.shake : 0;
+    const zoom = 1 + fx.zoom;
+    x.save();
+    x.translate(v.cx + shx, v.cy + shy);
+    x.scale(zoom, zoom);
+    x.translate(-v.cx, -v.cy);
+    x.drawImage(this.buf, 0, 0, this.w, this.h);
+    if (fx.rgb > 0) { /* chromatic split, 2-3 frames per fire */
+      const off = cfg.RGB_OFFSET_PX;
+      x.globalCompositeOperation = 'lighter';
+      x.globalAlpha = 0.4;
+      if (this.hasFilter) x.filter = 'hue-rotate(120deg) saturate(2.2)';
+      x.drawImage(this.buf, off, 0, this.w, this.h);
+      if (this.hasFilter) x.filter = 'hue-rotate(240deg) saturate(2.2)';
+      x.drawImage(this.buf, -off, 0.5, this.w, this.h);
+      if (this.hasFilter) x.filter = 'none';
+      x.globalAlpha = 1;
+      x.globalCompositeOperation = 'source-over';
+    }
+    x.restore();
+    if (fx.flash > 0) {
+      x.fillStyle = 'rgba(255,255,255,' + Math.min(1, fx.flash) + ')';
+      x.fillRect(0, 0, this.w, this.h);
+    }
+
+    /* --- crisp overlays (unaffected by zoom/rgb) ------------------ */
+    this.drawHud(x, g);
+    if (g.state === 'result') this.drawResult(x, g);
+    if (g.tut.open) this.drawTutorial(x, g);
+    if (g.paused) this.drawPaused(x, g);
+  }
+
+  drawTutorial(x, g) { /* how-to-play panel over the living title (R2-2) */
+    const v = g.view;
+    x.fillStyle = 'rgba(3,2,10,0.78)';
+    x.fillRect(0, 0, v.w, v.h);
+    /* lay out at a fixed logical 600px width (bodies wrapped by
+     * measureText), then scale the whole panel uniformly so it always
+     * fits the viewport — phones portrait AND landscape included      */
+    const LW = 600, PAD = 26, LINE = 17, HEAD = 20, GAP = 12;
+    x.font = '400 13px ' + UI_FONT;
+    const rows = TUT_ROWS.map(r => ({ r, lines: this.wrapText(x, r.body, LW - PAD * 2) }));
+    let LH = PAD + 46;
+    for (const it of rows) LH += HEAD + it.lines.length * LINE + GAP;
+    LH += 40;
+    const s = Math.min(1, (v.w - 20) / LW, (v.h - 20) / LH);
+    x.save();
+    x.translate(v.cx - (LW * s) / 2, Math.max(10, v.cy - (LH * s) / 2));
+    x.scale(s, s);
+    x.fillStyle = 'rgba(12,9,28,0.94)';
+    x.strokeStyle = 'rgba(140,120,220,0.5)';
+    x.lineWidth = 1.5;
+    this.rrect(x, 0, 0, LW, LH, 14);
+    x.fill(); x.stroke();
+    x.textBaseline = 'alphabetic';
+    x.textAlign = 'center';
+    x.font = '700 24px ' + UI_FONT;
+    x.fillStyle = 'rgba(255,246,214,0.95)';
+    x.fillText('遊び方', LW / 2, PAD + 22);
+    let y = PAD + 46;
+    x.textAlign = 'left';
+    for (const it of rows) {
+      x.font = '700 14px ' + UI_FONT;
+      x.fillStyle = 'hsla(' + it.r.hue + ',90%,72%,0.95)';
+      x.fillText(it.r.head, PAD, y + 14);
+      x.font = '400 13px ' + UI_FONT;
+      x.fillStyle = 'rgba(214,208,240,0.85)';
+      let ly = y + HEAD + 13;
+      for (const ln of it.lines) { x.fillText(ln, PAD, ly); ly += LINE; }
+      y += HEAD + it.lines.length * LINE + GAP;
+    }
+    x.textAlign = 'center';
+    x.font = '600 14px ' + UI_FONT;
+    x.fillStyle = 'rgba(255,240,200,' + (0.6 + 0.3 * Math.sin(g.now * 3)) + ')';
+    x.fillText('クリックで閉じてスタート（タイトル画面では H で再表示）', LW / 2, LH - 18);
+    x.restore();
+    x.textAlign = 'left';
+  }
+
+  /* JP text has no spaces: wrap greedily per glyph via measureText */
+  wrapText(x, text, maxW) {
+    const out = [];
+    let cur = '';
+    for (const ch of text) {
+      if (cur && x.measureText(cur + ch).width > maxW) { out.push(cur); cur = ch; }
+      else cur += ch;
+    }
+    if (cur) out.push(cur);
+    return out;
+  }
+
+  rrect(x, px, py, w, h, r) {
+    x.beginPath();
+    x.moveTo(px + r, py);
+    x.arcTo(px + w, py, px + w, py + h, r);
+    x.arcTo(px + w, py + h, px, py + h, r);
+    x.arcTo(px, py + h, px, py, r);
+    x.arcTo(px, py, px + w, py, r);
+    x.closePath();
+  }
+
+  drawGrid(c, g, hue) {
+    const v = g.view, cfg = g.cfg;
+    const pulse = 0.035 + g.fx.gridPulse * 0.08 + g.outerHeat * 0.05;
+    c.lineWidth = 1;
+    for (let b = 0; b < cfg.PITCH_BANDS; b++) {
+      const r = bandRadiusNorm(b, cfg) * v.R;
+      c.strokeStyle = 'hsla(' + hue + ',70%,60%,' + (pulse * (0.5 + 0.5 * b / cfg.PITCH_BANDS)) + ')';
+      c.beginPath();
+      c.arc(v.cx, v.cy, r, 0, TAU);
+      c.stroke();
+    }
+    /* arena rim + inner dead zone */
+    c.strokeStyle = 'hsla(' + hue + ',80%,65%,' + (0.16 + g.fx.gridPulse * 0.2) + ')';
+    c.lineWidth = 1.5;
+    c.beginPath(); c.arc(v.cx, v.cy, v.R, 0, TAU); c.stroke();
+    c.strokeStyle = 'hsla(' + hue + ',40%,45%,0.10)';
+    c.lineWidth = 1;
+    c.beginPath(); c.arc(v.cx, v.cy, v.innerR, 0, TAU); c.stroke();
+    /* 16 radial spokes */
+    for (let s = 0; s < cfg.STEPS_PER_REV; s++) {
+      const a = this.stepAngle(s, cfg);
+      const beat = s % 4 === 0;
+      c.strokeStyle = 'hsla(' + hue + ',60%,60%,' + (beat ? 0.06 : 0.03) + ')';
+      c.beginPath();
+      c.moveTo(v.cx + Math.cos(a) * v.innerR * 0.4, v.cy + Math.sin(a) * v.innerR * 0.4);
+      c.lineTo(v.cx + Math.cos(a) * v.R, v.cy + Math.sin(a) * v.R);
+      c.stroke();
+    }
+  }
+
+  drawHead(c, g, hue) {
+    const v = g.view;
+    const a = g.headAngle;
+    /* radar afterglow: fading trailing spokes */
+    const N = 22;
+    for (let i = N; i >= 1; i--) {
+      const aa = a - i * 0.012 * TAU;
+      const al = 0.10 * (1 - i / N);
+      c.strokeStyle = 'hsla(' + (hue + 20) + ',85%,64%,' + al + ')';
+      c.lineWidth = 2;
+      c.beginPath();
+      c.moveTo(v.cx, v.cy);
+      c.lineTo(v.cx + Math.cos(aa) * v.R, v.cy + Math.sin(aa) * v.R);
+      c.stroke();
+    }
+    /* leading edge */
+    const gr = c.createLinearGradient(v.cx, v.cy,
+      v.cx + Math.cos(a) * v.R, v.cy + Math.sin(a) * v.R);
+    gr.addColorStop(0, 'hsla(' + (hue + 30) + ',90%,70%,0.05)');
+    gr.addColorStop(1, 'hsla(' + (hue + 30) + ',95%,78%,0.85)');
+    c.strokeStyle = gr;
+    c.lineWidth = 2.2;
+    c.beginPath();
+    c.moveTo(v.cx, v.cy);
+    c.lineTo(v.cx + Math.cos(a) * v.R, v.cy + Math.sin(a) * v.R);
+    c.stroke();
+    /* hub */
+    c.fillStyle = 'hsla(' + hue + ',80%,75%,0.5)';
+    c.beginPath(); c.arc(v.cx, v.cy, 3, 0, TAU); c.fill();
+  }
+
+  drawSeeds(c, g) {
+    const cfg = g.cfg, t = g.now;
+    const curLoopF = g.head ? g.head.loop + g.head.phase : 0;
+    for (const arr of g.field.slots) {
+      for (const n of arr) {
+        if (n.dead) continue;
+        const p = this.notePos(n, g);
+        const age = clamp(curLoopF - n.loop, 0, cfg.NOTE_LIFETIME);
+        const fade = Math.pow(0.65, Math.max(0, age - 1));
+        const pulse = 1 + 0.25 * Math.sin(t * 4.2 + n.id * 1.7);
+        const flash = n.firedFlash > 0 ? n.firedFlash : 0;
+        const hue = bandHue(n.band, cfg.PITCH_BANDS);
+        const sz = (2.2 + n.band * 0.22) * pulse * fade + flash * 6;
+        const a = (0.28 + 0.5 * fade) * (g.state === 'result' ? 0.9 : 1) + flash * 0.6;
+        const gr = c.createRadialGradient(p.x, p.y, 0, p.x, p.y, sz * 3 + 2);
+        gr.addColorStop(0, 'hsla(' + hue + ',95%,72%,' + Math.min(1, a) + ')');
+        gr.addColorStop(1, 'hsla(' + hue + ',95%,55%,0)');
+        c.fillStyle = gr;
+        c.beginPath(); c.arc(p.x, p.y, sz * 3 + 2, 0, TAU); c.fill();
+        c.fillStyle = 'hsla(' + hue + ',100%,85%,' + Math.min(1, a + 0.15) + ')';
+        c.beginPath(); c.arc(p.x, p.y, Math.max(1, sz), 0, TAU); c.fill();
+      }
+    }
+  }
+
+  drawRings(c, g) {
+    const cfg = g.cfg, v = g.view;
+    for (const r of g.rings) {
+      if (!r.alive) continue;
+      const fade = clamp(1 - r.r / (v.R * 2), 0, 1);
+      if (r.harmless) {
+        c.strokeStyle = 'hsla(260,60%,80%,' + (0.14 * fade) + ')';
+        c.lineWidth = 2;
+      } else {
+        const hue = bandHue(r.band, cfg.PITCH_BANDS);
+        c.strokeStyle = 'hsla(' + hue + ',95%,66%,' + (0.16 + 0.62 * fade) + ')';
+        c.lineWidth = cfg.RING_BAND;
+      }
+      c.beginPath(); c.arc(r.x, r.y, Math.max(0.5, r.r), 0, TAU); c.stroke();
+      if (!r.harmless && fade > 0.25) { /* bright core line */
+        c.strokeStyle = 'hsla(' + bandHue(r.band, cfg.PITCH_BANDS) + ',100%,88%,' + (0.5 * fade) + ')';
+        c.lineWidth = 1.2;
+        c.beginPath(); c.arc(r.x, r.y, Math.max(0.5, r.r), 0, TAU); c.stroke();
+      }
+    }
+  }
+
+  drawStitches(c, g) { /* recording threads: player -> stitched seed */
+    for (const s of g.stitches) {
+      if (s.life <= 0) continue;
+      const a = s.life / s.maxLife;
+      c.strokeStyle = 'hsla(' + s.hue + ',95%,80%,' + (0.7 * a) + ')';
+      c.lineWidth = 1.2;
+      c.beginPath();
+      c.moveTo(s.x1, s.y1);
+      c.lineTo(lerp(s.x1, s.x2, 1 - a * 0.3), lerp(s.y1, s.y2, 1 - a * 0.3));
+      c.stroke();
+    }
+  }
+
+  drawGhosts(c, g) { /* causal ghost: past trail comet + linking thread */
+    for (const gh of g.ghosts) {
+      if (gh.done) continue;
+      const prog = clamp((g.now - gh.t0) / gh.dur, 0, 1);
+      const alpha = Math.sin(prog * Math.PI);
+      const pts = gh.points;
+      if (pts.length < 2) continue;
+      const fi = prog * (pts.length - 1);
+      const i0 = Math.floor(fi), frac = fi - i0;
+      const p1 = pts[Math.min(i0 + 1, pts.length - 1)], p0 = pts[i0];
+      const gx = lerp(p0.x, p1.x, frac), gy = lerp(p0.y, p1.y, frac);
+      /* trail behind the ghost head */
+      for (let i = 0; i <= i0; i++) {
+        const ta = alpha * 0.35 * (i / (i0 + 1));
+        c.fillStyle = 'hsla(190,90%,80%,' + ta + ')';
+        c.beginPath(); c.arc(pts[i].x, pts[i].y, 2.2, 0, TAU); c.fill();
+      }
+      const gr = c.createRadialGradient(gx, gy, 0, gx, gy, 12);
+      gr.addColorStop(0, 'hsla(190,100%,85%,' + (0.85 * alpha) + ')');
+      gr.addColorStop(1, 'hsla(190,100%,70%,0)');
+      c.fillStyle = gr;
+      c.beginPath(); c.arc(gx, gy, 12, 0, TAU); c.fill();
+      /* thread: ghost -> current player (「この弾…さっきの俺だ」) */
+      c.strokeStyle = 'hsla(190,100%,85%,' + (0.55 * alpha) + ')';
+      c.lineWidth = 1;
+      c.beginPath();
+      c.moveTo(gx, gy);
+      c.lineTo(g.player.x, g.player.y);
+      c.stroke();
+      /* thread: ghost -> the seed about to bloom */
+      c.strokeStyle = 'hsla(50,100%,80%,' + (0.4 * alpha) + ')';
+      c.beginPath();
+      c.moveTo(gx, gy);
+      c.lineTo(gh.nx, gh.ny);
+      c.stroke();
+    }
+  }
+
+  drawPlayer(c, g) {
+    const p = g.player, cfg = g.cfg;
+    const heat = g.outerHeat; /* 0..1 outer-band dwelling: longer, brighter tail */
+    const tr = p.trail;
+    for (let i = 0; i < tr.length; i++) {
+      const f = i / tr.length;
+      const a = f * (0.22 + heat * 0.3);
+      c.fillStyle = 'hsla(' + (200 - heat * 150) + ',95%,' + (70 + heat * 12) + '%,' + a + ')';
+      c.beginPath();
+      c.arc(tr[i].x, tr[i].y, 1 + f * (3.5 + heat * 2.5), 0, TAU);
+      c.fill();
+    }
+    const gr = c.createRadialGradient(p.x, p.y, 0, p.x, p.y, 14 + heat * 6);
+    gr.addColorStop(0, 'hsla(48,100%,88%,0.95)');
+    gr.addColorStop(0.35, 'hsla(' + (200 - heat * 150) + ',95%,72%,0.5)');
+    gr.addColorStop(1, 'hsla(220,90%,60%,0)');
+    c.fillStyle = gr;
+    c.beginPath(); c.arc(p.x, p.y, 14 + heat * 6, 0, TAU); c.fill();
+    c.fillStyle = '#fff';
+    c.beginPath(); c.arc(p.x, p.y, 2.6, 0, TAU); c.fill();
+  }
+
+  drawParticles(c, g) {
+    for (const p of g.particles.ps) {
+      if (!p.alive) continue;
+      const a = clamp(p.life / p.maxLife, 0, 1);
+      c.fillStyle = 'hsla(' + p.hue + ',' + p.sat + '%,' + p.lit + '%,' + (a * 0.9) + ')';
+      c.beginPath();
+      c.arc(p.x, p.y, p.size * (0.4 + 0.6 * a), 0, TAU);
+      c.fill();
+    }
+  }
+
+  drawPopups(c, g) { /* floating "+n" on maturity bank */
+    if (!g.popups || !g.popups.length) return;
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    for (const pu of g.popups) {
+      const a = clamp(pu.life / pu.maxLife, 0, 1);
+      c.font = '700 15px ' + UI_FONT;
+      c.fillStyle = 'hsla(46,100%,76%,' + (0.9 * a) + ')';
+      c.fillText(pu.text, pu.x, pu.y);
+    }
+    c.textAlign = 'left';
+    c.textBaseline = 'alphabetic';
+  }
+
+  drawTitle(c, g) { /* the title IS revolution zero (G1) */
+    const T = g.title, v = g.view, cfg = g.cfg;
+    c.textAlign = 'center';
+    c.textBaseline = 'middle';
+    for (const L of T.letters) {
+      const a = this.stepAngle(L.step, cfg);
+      const r = bandRadiusNorm(L.band, cfg) * v.R;
+      const x = v.cx + Math.cos(a) * r, y = v.cy + Math.sin(a) * r;
+      const pulse = L.pulse;
+      const alpha = T.alpha * (0.72 + pulse * 0.5);
+      const size = 26 + pulse * 10;
+      c.font = '700 ' + size + 'px ' + UI_FONT;
+      c.fillStyle = 'hsla(' + (48 + pulse * 10) + ',95%,' + (78 + pulse * 12) + '%,' + alpha + ')';
+      c.fillText(L.ch, x, y);
+    }
+    /* faint center wordmark */
+    c.font = '200 ' + Math.round(v.R * 0.16) + 'px ' + UI_FONT;
+    c.fillStyle = 'hsla(260,60%,85%,' + (0.10 * T.alpha) + ')';
+    const word = 'O S T I N A T O';
+    c.fillText(word, v.cx, v.cy);
+    c.textAlign = 'left';
+    c.textBaseline = 'alphabetic';
+  }
+
+  drawCollapse(c, g) { /* board dissolving into ripples */
+    const v = g.view;
+    for (const rp of g.collapseRipples) {
+      const a = clamp(rp.alpha, 0, 1);
+      if (a <= 0) continue;
+      c.strokeStyle = 'hsla(' + g.hue + ',90%,75%,' + (a * 0.7) + ')';
+      c.lineWidth = 2.5;
+      c.beginPath(); c.arc(v.cx, v.cy, rp.r, 0, TAU); c.stroke();
+    }
+  }
+
+  drawHud(x, g) {
+    if (g.state === 'attract') { /* title: keep the frame clean */
+      const v0 = g.view;
+      if (g.best.score > 0) {
+        x.textAlign = 'right';
+        x.font = '600 13px ' + UI_FONT;
+        x.fillStyle = 'rgba(190,182,235,0.5)';
+        x.fillText('ベスト ' + fmtNum(g.best.score), v0.w - 18, 30);
+        x.textAlign = 'left';
+      }
+      if (!g.tut.open) {
+        /* start prompt + how-to-play button (R2-2) */
+        x.textAlign = 'center';
+        x.font = '500 15px ' + UI_FONT;
+        x.fillStyle = 'rgba(210,200,255,' + (0.5 + 0.25 * Math.sin(g.now * 2.2)) + ')';
+        x.fillText('マウスを盤面に入れるとスタート', v0.cx, v0.h - 42);
+        /* hitbox hugs the label only, one line below the start prompt,
+         * so narrow viewports cannot overlap the two click targets    */
+        g.tut.btn = { x: v0.w - 118, y: v0.h - 34, w: 104, h: 22 };
+        x.textAlign = 'right';
+        x.font = '600 13px ' + UI_FONT;
+        x.fillStyle = 'rgba(190,182,235,0.75)';
+        x.fillText('？ 遊び方 (H)', v0.w - 20, v0.h - 19);
+        x.textAlign = 'left';
+      }
+      if (!g.audio.unlocked) this.drawAudioHint(x, g);
+      return;
+    }
+    const v = g.view;
+    x.textBaseline = 'alphabetic';
+    /* score (banked) — top left */
+    x.textAlign = 'left';
+    x.font = '600 13px ' + UI_FONT;
+    x.fillStyle = 'rgba(190,182,235,0.75)';
+    x.fillText('スコア', 18, 30);
+    x.font = '700 30px ' + UI_FONT;
+    x.fillStyle = 'rgba(255,246,214,0.95)';
+    x.fillText(fmtNum(g.hud.scoreDisplay), 18, 62);
+    if (g.bank.pending > 0) {
+      x.font = '600 15px ' + UI_FONT;
+      x.fillStyle = 'hsla(48,95%,68%,' + (0.6 + 0.3 * Math.sin(g.now * 5)) + ')';
+      x.fillText('+' + fmtNum(g.bank.pending) + ' 未確定', 18, 86);
+    }
+    /* best — top right */
+    x.textAlign = 'right';
+    x.font = '600 13px ' + UI_FONT;
+    x.fillStyle = 'rgba(190,182,235,0.6)';
+    x.fillText('ベスト', v.w - 18, 30);
+    x.font = '600 20px ' + UI_FONT;
+    x.fillStyle = 'rgba(230,222,255,0.7)';
+    x.fillText(fmtNum(g.best.score), v.w - 18, 54);
+    /* loop / notes — bottom left */
+    if (g.state !== 'attract') {
+      x.textAlign = 'left';
+      x.font = '600 14px ' + UI_FONT;
+      x.fillStyle = 'rgba(190,182,235,0.65)';
+      x.fillText('周回 ' + Math.max(1, g.runLoop) + '　音符 ' + g.field.count(), 18, v.h - 20);
+    }
+    if (!g.audio.unlocked) this.drawAudioHint(x, g);
+    if (g.tut.hint) this.drawHint(x, g);
+    x.textAlign = 'left';
+  }
+
+  drawHint(x, g) { /* first-run contextual hint, fades out (R2-2) */
+    const v = g.view, h = g.tut.hint;
+    const a = clamp(h.until - g.now, 0, 1) * 0.85;
+    x.textAlign = 'center';
+    x.font = '600 15px ' + UI_FONT;
+    x.fillStyle = 'rgba(255,240,200,' + a + ')';
+    x.fillText(h.text, v.cx, v.h - 46);
+    x.textAlign = 'left';
+  }
+
+  drawAudioHint(x, g) {
+    const v = g.view;
+    x.textAlign = 'center';
+    x.font = '600 13px ' + UI_FONT;
+    x.fillStyle = 'rgba(255,240,200,' + (0.45 + 0.3 * Math.sin(g.now * 4)) + ')';
+    x.fillText('クリックで音が出ます', v.cx, v.h - 16);
+    x.textAlign = 'left';
+  }
+
+  drawResult(x, g) {
+    const v = g.view, res = g.result;
+    const tIn = clamp((g.now - res.t0) / 0.8, 0, 1);
+    x.fillStyle = 'rgba(2,1,10,' + (0.45 * tIn) + ')';
+    x.fillRect(0, 0, v.w, v.h);
+    x.textAlign = 'center';
+    const cy = v.cy;
+    x.globalAlpha = tIn;
+    x.font = '300 22px ' + UI_FONT;
+    x.fillStyle = 'rgba(210,200,255,0.9)';
+    x.fillText('あなたの遺曲', v.cx, cy - 74);
+    x.font = '700 40px ' + UI_FONT;
+    x.fillStyle = 'rgba(255,246,214,0.98)';
+    x.fillText(res.notes + '音 / ' + res.loops + '周', v.cx, cy - 26);
+    x.font = '600 26px ' + UI_FONT;
+    x.fillStyle = 'hsla(48,95%,72%,0.95)';
+    x.fillText('SCORE ' + fmtNum(res.score), v.cx, cy + 14);
+    if (res.lost > 0) {
+      x.font = '500 15px ' + UI_FONT;
+      x.fillStyle = 'rgba(255,140,140,0.7)';
+      x.fillText('失った未確定 −' + fmtNum(res.lost), v.cx, cy + 42);
+    }
+    if (res.newBest) {
+      x.font = '700 16px ' + UI_FONT;
+      x.fillStyle = 'hsla(' + (45 + 10 * Math.sin(g.now * 6)) + ',100%,75%,0.95)';
+      x.fillText('NEW BEST', v.cx, cy + 70);
+    }
+    x.font = '500 15px ' + UI_FONT;
+    x.fillStyle = 'rgba(200,192,240,' + (0.5 + 0.35 * Math.sin(g.now * 3)) + ')';
+    x.fillText('クリック / R でもう一度', v.cx, cy + 104);
+    x.globalAlpha = 1;
+    x.textAlign = 'left';
+  }
+
+  drawPaused(x, g) {
+    const v = g.view;
+    x.fillStyle = 'rgba(2,1,10,0.6)';
+    x.fillRect(0, 0, v.w, v.h);
+    x.textAlign = 'center';
+    x.font = '600 24px ' + UI_FONT;
+    x.fillStyle = 'rgba(230,222,255,0.9)';
+    x.fillText('一時停止', v.cx, v.cy);
+    x.font = '500 14px ' + UI_FONT;
+    x.fillStyle = 'rgba(190,182,235,0.7)';
+    x.fillText('クリックで再開', v.cx, v.cy + 32);
+    x.textAlign = 'left';
+  }
+}
+
+/* =====================================================================
+ * [F] Game core
+ * =================================================================== */
+
+/* how-to-play panel rows (R2-2). Bodies are wrapped by measureText in
+ * drawTutorial, so they may exceed the panel width.                  */
+const TUT_ROWS = [
+  { hue: 200, head: '動かすだけ', body: 'マウスで光点を操作（クリック不要・WASD でも可）' },
+  { hue: 260, head: '録音されている', body: '回る線があなたの位置を音符として盤面に刻む' },
+  { hue: 350, head: '弾は過去のあなた', body: '1周後、音符が鳴った場所からリングが放たれる。触れたら即終了' },
+  { hue: 48,  head: '外側ほど高音・高得点', body: 'そのぶん弾も速い。内側は 0 点で、そこにも弾は出る — 安全地帯は無い' },
+  { hue: 46,  head: '4周生き残ると満期', body: '音符の得点が ×2 で確定。死ぬと未確定分は消える' },
+  { hue: 280, head: '死＝一曲の完成', body: 'あなたの軌跡が「遺曲」となって流れる。R で即リトライ' },
+];
+
+/* the title letters ARE revolution zero: each letter is a decorative
+ * note playing the signature melody and emitting harmless rings (G1) */
+const TITLE_SEQ = [
+  { ch: 'O', step: 0,  band: 7 }, { ch: 'S', step: 2,  band: 5 },
+  { ch: 'T', step: 4,  band: 8 }, { ch: 'I', step: 6,  band: 6 },
+  { ch: 'N', step: 8,  band: 9 }, { ch: 'A', step: 10, band: 5 },
+  { ch: 'T', step: 12, band: 7 }, { ch: 'O', step: 14, band: 4 },
+];
+
+class Game {
+  constructor(env) {
+    this.env = env;
+    this.cfg = CONFIG;
+    this.clock = new MusicClock();
+    this.audio = new AudioEngine(env, this.cfg, this.clock);
+    this.renderer = new Renderer(env);
+    this.particles = new ParticlePool(this.cfg.MAX_PARTICLES);
+    this.view = { w: 2, h: 2, cx: 1, cy: 1, R: 1, innerR: 1 };
+    this.best = this.loadBest();
+    this.tut = this.initTutorial();
+    this.paused = false;
+    this.inputActive = false;
+    this.pointerIn = false;
+    this.keys = { up: false, down: false, left: false, right: false };
+    this.player = { x: 0, y: 0, tx: 0, ty: 0, trail: [], visible: false };
+    this.trailBuf = [];
+    this.now = 0;
+    this.acc = 0;
+    this.rings = [];
+    for (let i = 0; i < this.cfg.MAX_RINGS; i++) {
+      this.rings.push({ alive: false, x: 0, y: 0, r: 0, speed: 0, band: 0, harmless: false });
+    }
+    this.audio.init();
+    this.resetRun(true);
+  }
+
+  /* ---- persistence ------------------------------------------------ */
+  loadBest() {
+    const b = { score: 0, notes: 0, loops: 0 };
+    try {
+      const s = this.env.storage;
+      if (s) {
+        const sc = parseInt(s.getItem('ostinato.best') || '0', 10);
+        if (Number.isFinite(sc)) b.score = sc;
+        const song = JSON.parse(s.getItem('ostinato.bestSong') || 'null');
+        if (song && Number.isFinite(song.notes)) { b.notes = song.notes; b.loops = song.loops || 0; }
+      }
+    } catch (e) {}
+    return b;
+  }
+  saveBest() {
+    try {
+      const s = this.env.storage;
+      if (!s) return;
+      s.setItem('ostinato.best', String(this.best.score));
+      s.setItem('ostinato.bestSong', JSON.stringify({ notes: this.best.notes, loops: this.best.loops }));
+    } catch (e) {}
+  }
+
+  /* ---- tutorial (R2-2) --------------------------------------------- */
+  initTutorial() {
+    let seen = false;
+    try { seen = !!(this.env.storage && this.env.storage.getItem('ostinato.tutorialSeen')); } catch (e) {}
+    /* fresh = first-ever visit: auto-open the panel + in-run hints */
+    return { open: false, seen, fresh: !seen, autoDone: seen, hint: null, btn: null };
+  }
+  markTutorialSeen() {
+    this.tut.seen = true;
+    try { if (this.env.storage) this.env.storage.setItem('ostinato.tutorialSeen', '1'); } catch (e) {}
+  }
+  toggleTutorial() {
+    if (this.state !== 'attract') return;
+    this.tut.open = !this.tut.open;
+    if (!this.tut.open) this.markTutorialSeen();
+  }
+  showHint(text) {
+    /* first session only, and each message only once — restarts must
+     * not replay hints the player has already read                    */
+    if (!this.tut.fresh) return;
+    if (!this.tut.shown) this.tut.shown = {};
+    if (this.tut.shown[text]) return;
+    this.tut.shown[text] = 1;
+    this.tut.hint = { text, until: this.now + 4.5 };
+  }
+  tutBtnHit(x, y) {
+    const b = this.tut.btn;
+    return !!b && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h;
+  }
+
+  /* ---- run lifecycle ---------------------------------------------- */
+  resetRun(firstRun) {
+    const cfg = this.cfg;
+    this.state = 'attract';
+    this.timeline = new StepTimeline(cfg, this.clock.t + 0.05);
+    this.timeline.decayHold = true;   /* released when recording starts */
+    this.field = new NoteField(cfg);
+    this.bank = new Bank(cfg);
+    for (const r of this.rings) r.alive = false;
+    this.visualQueue = [];
+    this.stitches = [];
+    this.ghosts = [];
+    this.popups = [];
+    this.collapseRipples = [];
+    this.title = {
+      active: !!firstRun,
+      alpha: 1,
+      letters: TITLE_SEQ.map(L => ({ ch: L.ch, step: L.step, band: L.band, pulse: 0 })),
+      byStep: {},
+    };
+    for (const L of this.title.letters) this.title.byStep[L.step] = L;
+    this.entryLoopF = null;   /* head loop-float when recording began */
+    this.armLoopF = null;     /* entry + 1: bullets live from here    */
+    this.ghostCueLeft = cfg.GHOST_CUE_COUNT;
+    this.fx = { rgb: 0, zoom: 0, shake: 0, flash: 0, gridPulse: 0 };
+    this.hud = { scoreDisplay: 0 };
+    this.head = { loop: 0, phase: 0, period: cfg.REV_PERIOD_START };
+    this.headAngle = -Math.PI / 2;
+    this.prevStepFloat = null;
+    this.runLoop = 0;
+    this.outerHeat = 0;
+    this.hue = cfg.HUE_START;
+    this.result = null;
+    this.requiem = null;
+    this.deathInfo = null;
+  }
+
+  restart() {
+    this.audio.disablePad();
+    this.audio.restoreBed();
+    this.particles.clear();
+    this.resetRun(false);
+  }
+
+  resize(w, h, dpr) {
+    const v = this.view;
+    v.w = w; v.h = h;
+    v.cx = w / 2; v.cy = h / 2;
+    const m = Math.min(w, h);
+    v.R = this.cfg.ARENA_R * m;
+    v.innerR = this.cfg.INNER_DEAD_R * m;
+    this.renderer.resize(w, h, dpr);
+    if (!this.inputActive) {
+      this.player.x = this.player.tx = v.cx;
+      this.player.y = this.player.ty = v.cy + v.R * 0.55;
+    }
+  }
+
+  /* ---- input -------------------------------------------------------- */
+  pointerMove(x, y, isTouch) {
+    if (isTouch) y -= this.cfg.TOUCH_OFFSET; /* keep the comet above the finger */
+    this.inputActive = true;
+    this.player.visible = true;
+    const v = this.view;
+    const dx = x - v.cx, dy = y - v.cy;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    const max = v.R * 0.99;
+    if (d > max) { x = v.cx + dx / d * max; y = v.cy + dy / d * max; }
+    this.player.tx = x; this.player.ty = y;
+    this.pointerIn = d <= v.R;
+    /* harmless if not a real user activation — but never while paused:
+     * resuming the ctx would play the bed behind the pause overlay      */
+    if (!this.paused) this.audio.tryUnlock();
+  }
+  pointerDown(x, y, isTouch) {
+    this.audio.tryUnlock();
+    if (this.paused) { this.setPaused(false); return; }
+    if (this.state === 'result') { this.restart(); return; }
+    if (this.state === 'attract') {
+      /* a click closes the how-to-play panel (= seen) or opens it via
+       * the corner button; neither click starts the run itself         */
+      if (this.tut.open) { this.toggleTutorial(); return; }
+      if (x != null && this.tutBtnHit(x, y)) { this.toggleTutorial(); return; }
+    }
+    if (x != null) this.pointerMove(x, y, isTouch);
+  }
+  keyInput(code, down) {
+    if (down && !this.paused) this.audio.tryUnlock();
+    switch (code) {
+      case 'KeyW': case 'ArrowUp': this.keys.up = down; break;
+      case 'KeyS': case 'ArrowDown': this.keys.down = down; break;
+      case 'KeyA': case 'ArrowLeft': this.keys.left = down; break;
+      case 'KeyD': case 'ArrowRight': this.keys.right = down; break;
+      case 'KeyR':
+        if (down && this.state === 'result') this.restart();
+        return;
+      case 'KeyH':
+        /* not while paused: the pause veil covers the panel, and a
+         * hidden close would consume the one-time auto-open unseen   */
+        if (down && !this.paused) this.toggleTutorial();
+        return;
+      default: return;
+    }
+    if (down) {
+      this.inputActive = true;
+      this.player.visible = true;
+      this.pointerIn = true; /* keyboard target is always clamped in-arena */
+    }
+  }
+  setPaused(p) {
+    if (this.paused === p) return;
+    this.paused = p;
+    if (p) this.audio.suspend(); else this.audio.resume();
+  }
+
+  /* ---- helpers ------------------------------------------------------ */
+  notePosPx(step, band) {
+    const a = (step / this.cfg.STEPS_PER_REV) * TAU - Math.PI / 2;
+    const r = bandRadiusNorm(band, this.cfg) * this.view.R;
+    return { x: this.view.cx + Math.cos(a) * r, y: this.view.cy + Math.sin(a) * r };
+  }
+  pushVisual(ev) {
+    const q = this.visualQueue;
+    let i = q.length;
+    while (i > 0 && q[i - 1].t > ev.t) i--;
+    q.splice(i, 0, ev);
+    /* bound the queue: on a hidden tab rAF (the only consumer) stops but
+     * the interval keeps enqueuing reqFires — drop oldest, keep memory flat */
+    if (q.length > 512) q.splice(0, q.length - 512);
+  }
+  spawnRing(x, y, band, speed, harmless) {
+    let best = null, oldest = null;
+    for (const r of this.rings) {
+      if (!r.alive) { best = r; break; }
+      if (!oldest || r.r > oldest.r) oldest = r;
+    }
+    const r = best || oldest;
+    r.alive = true; r.x = x; r.y = y; r.r = 0;
+    r.speed = speed; r.band = band; r.harmless = !!harmless;
+    return r;
+  }
+
+  /* ---- the lookahead commit: one 16th-note step -------------------- *
+   * Called from StepTimeline.advanceUntil with evt.time up to
+   * LOOKAHEAD_MS ahead. Audio is scheduled sample-accurately here;
+   * the matching visuals go into visualQueue and are consumed when
+   * music-time catches up — audio and visuals share one clock.        */
+  commitStep(evt) {
+    const cfg = this.cfg;
+    const stepsN = cfg.STEPS_PER_REV;
+    const evtLoopF = evt.loop + evt.step / stepsN;
+    const armed = this.armLoopF != null && evtLoopF >= this.armLoopF - 1e-9;
+    const runLoop = this.entryLoopF == null ? 0
+      : Math.floor(evtLoopF - this.entryLoopF) + 1;
+    const beat = evt.step % 4 === 0;
+
+    /* layer unlock schedule (§5): L1 drone+hat+theremin / L2 pluck(arm)
+     * L4 bass / L6 pad / L9 16th hats / L12 kick                        */
+    const hat16 = runLoop >= 9;
+    if (hat16 || evt.step % 2 === 0) this.audio.hat(evt.time, beat);
+    if (runLoop >= 4 && evt.step % 8 === 0) this.audio.bass(evt.time);
+    if (runLoop >= 6) this.audio.enablePad();
+    if (runLoop >= 12 && beat) this.audio.kick(evt.time);
+
+    /* title letters: revolution zero's signature melody (pre-arm only) */
+    if (this.title.active && !armed) {
+      const L = this.title.byStep[evt.step];
+      if (L) {
+        this.audio.pluck(evt.time, L.band, 1, false, 0.3);
+        this.pushVisual({ type: 'titleFire', t: evt.time, letter: L });
+      }
+    }
+
+    if (!armed) return;
+
+    const onboard = evtLoopF < this.armLoopF + 1 ? cfg.LOOP2_ONBOARD : 1;
+    const fires = this.field.collectFires(evt.step, evt.loop);
+    for (const f of fires) {
+      this.bank.onFire(f.per);
+      const accent = beat || f.note.ghostCued;
+      this.audio.pluck(evt.time, f.note.band, f.age, accent);
+      this.audio.duck(evt.time);
+      this.pushVisual({
+        type: 'fire', t: evt.time, note: f.note, age: f.age,
+        accent: beat, runLoop, onboard,
+      });
+      if (f.matured) {
+        const gain = this.bank.onMature(f.note);
+        this.audio.chime(evt.time + 0.07, f.note.band);
+        this.pushVisual({ type: 'mature', t: evt.time + 0.06, note: f.note, gain });
+      }
+    }
+  }
+
+  /* ghost-cue pre-pass: peeks past the audio horizon (needs 300ms) and
+   * queues the causal-ghost replay for the first GHOST_CUE_COUNT fires */
+  ghostPrepass(now) {
+    if (this.armLoopF == null || this.ghostCueLeft <= 0) return;
+    const cfg = this.cfg;
+    const events = this.timeline.peek(now + cfg.GHOST_LEAD + 0.25);
+    for (const evt of events) {
+      if (this.ghostCueLeft <= 0) break;
+      const evtLoopF = evt.loop + evt.step / cfg.STEPS_PER_REV;
+      if (evtLoopF < this.armLoopF - 1e-9) continue;
+      for (const n of this.field.peekFires(evt.step, evt.loop)) {
+        if (this.ghostCueLeft <= 0) break;
+        if (n.ghostCued || !n.ghost || n.ghost.length < 2) continue;
+        n.ghostCued = true;
+        this.ghostCueLeft--;
+        this.pushVisual({
+          type: 'ghost', t: Math.max(now, evt.time - cfg.GHOST_LEAD),
+          note: n, dur: cfg.GHOST_LEAD,
+        });
+      }
+    }
+  }
+
+  /* ---- recording: plant a seed when the head crosses a step -------- */
+  plantAt(stepIdx, loopIdx) {
+    const cfg = this.cfg, v = this.view, p = this.player;
+    const dx = p.x - v.cx, dy = p.y - v.cy;
+    const rn = Math.sqrt(dx * dx + dy * dy) / v.R;
+    const band = bandFromRadius(rn, cfg);
+    let ghost = null;
+    if (this.ghostCueLeft > 0) { /* snapshot ~2 steps of past trajectory */
+      const span = (this.head.period / cfg.STEPS_PER_REV) * 2;
+      const cut = this.now - span;
+      const pts = [];
+      for (let i = 0; i < this.trailBuf.length; i++) {
+        if (this.trailBuf[i].t >= cut) pts.push(this.trailBuf[i]);
+      }
+      const stride = Math.max(1, Math.floor(pts.length / 12));
+      ghost = [];
+      for (let i = 0; i < pts.length; i += stride) ghost.push({ x: pts[i].x, y: pts[i].y });
+      ghost.push({ x: p.x, y: p.y });
+    }
+    const note = this.field.plant(stepIdx, band, loopIdx, ghost);
+    note.bornT = this.now;
+    const np = this.notePosPx(stepIdx, band);
+    this.stitches.push({
+      x1: p.x, y1: p.y, x2: np.x, y2: np.y,
+      life: 0.28, maxLife: 0.28, hue: bandHue(band, cfg.PITCH_BANDS),
+    });
+    if (this.stitches.length > 24) this.stitches.shift();
+  }
+
+  /* ---- visual queue consumption ------------------------------------ */
+  consumeVisuals(now) {
+    const q = this.visualQueue, cfg = this.cfg;
+    while (q.length && q[0].t <= now) {
+      const ev = q.shift();
+      if (ev.type === 'fire') {
+        const n = ev.note;
+        const p = this.notePosPx(n.step, n.band);
+        const speed = ringSpeedFor(n.band, ev.runLoop, cfg, ev.onboard);
+        this.spawnRing(p.x, p.y, n.band, speed, false);
+        n.firedFlash = 1;
+        this.fx.rgb = cfg.RGB_FRAMES;
+        this.fx.zoom = Math.max(this.fx.zoom, cfg.ZOOM_PULSE * (ev.accent ? 1.4 : 1));
+        if (ev.accent) {
+          this.fx.shake = cfg.SHAKE_PX;
+          this.fx.gridPulse = 1;
+        }
+        for (let i = 0; i < 4; i++) {
+          const a = cosmRand() * TAU;
+          this.particles.spawn({
+            x: p.x, y: p.y, vx: Math.cos(a) * 60, vy: Math.sin(a) * 60,
+            life: 0.4, size: 1.8, hue: bandHue(n.band, cfg.PITCH_BANDS), drag: 0.9,
+          });
+        }
+      } else if (ev.type === 'titleFire') {
+        const L = ev.letter;
+        L.pulse = 1;
+        const p = this.notePosPx(L.step, L.band);
+        this.spawnRing(p.x, p.y, L.band, cfg.RING_SPEED_BASE * 0.7, true);
+      } else if (ev.type === 'mature') {
+        const n = ev.note;
+        const p = this.notePosPx(n.step, n.band);
+        this.fx.gridPulse = 1;
+        this.popups.push({ x: p.x, y: p.y, text: '+' + fmtNum(ev.gain), life: 1.1, maxLife: 1.1 });
+        if (this.popups.length > 8) this.popups.shift();
+        for (let i = 0; i < 7; i++) { /* gold grains fly to the score */
+          const a = cosmRand() * TAU;
+          this.particles.spawn({
+            x: p.x, y: p.y,
+            vx: Math.cos(a) * 90, vy: Math.sin(a) * 90 - 30,
+            life: 2.2, size: 2.4, hue: 46, sat: 100, lit: 70,
+            drag: 0.94, tx: 40, ty: 56, home: 900,
+          });
+        }
+      } else if (ev.type === 'ghost') {
+        const n = ev.note;
+        const p = this.notePosPx(n.step, n.band);
+        this.ghosts.push({ points: n.ghost, nx: p.x, ny: p.y, t0: now, dur: ev.dur + 0.12, done: false });
+        if (this.ghosts.length > 6) this.ghosts.shift();
+      } else if (ev.type === 'reqFire') {
+        /* result board = score visualizer: bloom + soft echo ring */
+        ev.note.firedFlash = 1;
+        this.fx.gridPulse = Math.max(this.fx.gridPulse, 0.6);
+        const p = this.notePosPx(ev.note.step, ev.note.band);
+        this.spawnRing(p.x, p.y, ev.note.band, cfg.RING_SPEED_BASE * 0.5, true);
+      }
+    }
+  }
+
+  /* ---- fixed-timestep physics --------------------------------------- */
+  stepPhysics(h) {
+    const cfg = this.cfg, v = this.view, p = this.player;
+    const px0 = p.x, py0 = p.y; /* pre-move position for the swept hit test */
+    /* keyboard steers the target point at PLAYER_KB_SPEED */
+    let kx = (this.keys.right ? 1 : 0) - (this.keys.left ? 1 : 0);
+    let ky = (this.keys.down ? 1 : 0) - (this.keys.up ? 1 : 0);
+    if (kx || ky) {
+      const n = Math.sqrt(kx * kx + ky * ky);
+      p.tx += (kx / n) * cfg.PLAYER_KB_SPEED * h;
+      p.ty += (ky / n) * cfg.PLAYER_KB_SPEED * h;
+      const dx = p.tx - v.cx, dy = p.ty - v.cy;
+      const d = Math.sqrt(dx * dx + dy * dy), max = v.R * 0.99;
+      if (d > max) { p.tx = v.cx + dx / d * max; p.ty = v.cy + dy / d * max; }
+    }
+    /* eased pursuit (framerate-independent form of lerp 0.15 @60fps) */
+    const f = easeFactor(cfg.PLAYER_EASE, h);
+    p.x += (p.tx - p.x) * f;
+    p.y += (p.ty - p.y) * f;
+    const dx = p.x - v.cx, dy = p.y - v.cy;
+    const d = Math.sqrt(dx * dx + dy * dy), max = v.R * 0.995;
+    if (d > max) { p.x = v.cx + dx / d * max; p.y = v.cy + dy / d * max; }
+    /* rings expand; recycle past twice the arena.
+     * Collision lives HERE, per 120Hz substep and swept: a per-rAF-frame
+     * point sample lets a mouse flick (100px+/frame vs a 14px band)
+     * tunnel through walls — a dominant degenerate strategy against the
+     * one-graze-kills core rule (§4). Along the substep segment the
+     * distance-to-ring-center is continuous (min at the projection, max
+     * at an endpoint), so the path crosses the band iff that distance
+     * range overlaps the band's radius range — this also catches a small
+     * ring jumped over entirely (two crossings in one substep), which an
+     * endpoint sign test misses.                                        */
+    const lethal = this.state === 'playing';
+    const w = cfg.RING_BAND / 2 + cfg.PLAYER_HITBOX_R;
+    let hit = false;
+    for (const r of this.rings) {
+      if (!r.alive) continue;
+      const r0 = r.r;
+      r.r += r.speed * h;
+      if (r.r > v.R * 2.1) { r.alive = false; continue; }
+      if (!lethal || hit || r.harmless) continue;
+      const ax = px0 - r.x, ay = py0 - r.y;
+      const bx = p.x - r.x, by = p.y - r.y;
+      const d0 = Math.sqrt(ax * ax + ay * ay);
+      const d1 = Math.sqrt(bx * bx + by * by);
+      const sx = bx - ax, sy = by - ay;
+      const L2 = sx * sx + sy * sy;
+      /* time-correlated g(t) = dist(t) - radius(t), sampled at both
+       * endpoints (exact: g is convex, so its max is an endpoint) and at
+       * the distance minimizer. A plain range-overlap test decorrelates
+       * time and grows a false-kill shell of speed*h px on the outside —
+       * poison for a "every death is your fault" rule.                  */
+      let tq = 0;
+      if (L2 > 1e-12) tq = clamp(-(ax * sx + ay * sy) / L2, 0, 1);
+      const qx = ax + sx * tq, qy = ay + sy * tq;
+      const dq = Math.sqrt(qx * qx + qy * qy);
+      const g0 = d0 - r0, g1 = d1 - r.r, gq = dq - (r0 + (r.r - r0) * tq);
+      if (Math.min(g0, g1, gq) <= w && Math.max(g0, g1) >= -w) hit = true;
+    }
+    if (hit) { this.die(); return true; }
+    return false;
+  }
+
+  /* ---- death --------------------------------------------------------- */
+  die() {
+    const cfg = this.cfg;
+    this.state = 'dying';
+    this.fx.flash = 0.9;
+    this.hitstopEnd = this.now + cfg.HITSTOP_MS / 1000;
+    this.collapseStarted = false;
+    this.bank.onDeath();
+    /* snapshot the living notes: they are the requiem (遺曲) */
+    const headF = this.head.loop + this.head.phase;
+    this.requiemNotes = this.field.alive().map(n => {
+      n.reqAge = clamp(Math.round(headF - n.loop), 1, cfg.NOTE_LIFETIME);
+      return n;
+    });
+    this.deathInfo = {
+      notes: this.requiemNotes.length,
+      loops: Math.max(1, this.runLoop),
+      period: this.head.period,
+    };
+    this.visualQueue.length = 0;
+    this.ghosts.length = 0;
+    this.audio.deathCluster(this.now);
+  }
+
+  startCollapse() {
+    this.collapseStarted = true;
+    this.collapseEnd = this.now + 0.9;
+    this.collapseRipples = [];
+    for (let i = 0; i < 4; i++) {
+      this.collapseRipples.push({ r: this.view.R * 0.08 * i, speed: this.view.R * (1.6 + i * 0.5), alpha: 0.9 - i * 0.15 });
+    }
+    for (const r of this.rings) { /* rings dissolve into fast fading ripples */
+      if (r.alive) { r.harmless = true; r.speed *= 4; }
+    }
+    const v = this.view;
+    for (const n of this.requiemNotes) { /* seeds burst */
+      const p = this.notePosPx(n.step, n.band);
+      for (let i = 0; i < 2; i++) {
+        const a = cosmRand() * TAU;
+        this.particles.spawn({
+          x: p.x, y: p.y, vx: Math.cos(a) * 120, vy: Math.sin(a) * 120,
+          life: 0.8, size: 2, hue: bandHue(n.band, this.cfg.PITCH_BANDS), drag: 0.92,
+        });
+      }
+    }
+  }
+
+  enterResult() {
+    const cfg = this.cfg, d = this.deathInfo;
+    this.state = 'result';
+    let newBest = false;
+    if (this.bank.banked > this.best.score) { this.best.score = this.bank.banked; newBest = true; }
+    if (d.notes * d.loops > this.best.notes * this.best.loops) {
+      this.best.notes = d.notes; this.best.loops = d.loops;
+    }
+    this.saveBest();
+    this.result = {
+      t0: this.now, notes: d.notes, loops: d.loops,
+      score: this.bank.banked, lost: this.bank.lost, newBest,
+    };
+    /* the requiem: surviving notes loop at the death tempo, drowned in
+     * the synthetic-IR convolver reverb (遺曲再生)                       */
+    const reqCfg = {
+      STEPS_PER_REV: cfg.STEPS_PER_REV,
+      REV_PERIOD_START: d.period, REV_PERIOD_DECAY: 1, REV_PERIOD_MIN: d.period,
+    };
+    this.requiem = { timeline: new StepTimeline(reqCfg, this.now + 0.8, d.period) };
+  }
+
+  updateRequiem(now) {
+    const cfg = this.cfg;
+    this.requiem.timeline.advanceUntil(now + cfg.LOOKAHEAD_MS / 1000, evt => {
+      for (const n of this.requiemNotes) {
+        if (n.step !== evt.step) continue;
+        this.audio.requiemPluck(evt.time, n.band, n.reqAge);
+        this.pushVisual({ type: 'reqFire', t: evt.time, note: n });
+      }
+    });
+    const h = this.requiem.timeline.headAt(now);
+    this.head = h;
+    this.headAngle = -Math.PI / 2 + h.phase * TAU;
+  }
+
+  /* ---- per-frame update ---------------------------------------------- */
+  update(dt) {
+    if (this.paused) return;
+    dt = Math.min(dt, 0.1);
+    this.clock.advance(dt);
+    const now = this.now = this.clock.t;
+    const cfg = this.cfg;
+
+    /* HUD score counts up toward the banked truth */
+    this.hud.scoreDisplay += (this.bank.banked - this.hud.scoreDisplay) * easeFactor(0.12, dt);
+    if (Math.abs(this.bank.banked - this.hud.scoreDisplay) < 1) this.hud.scoreDisplay = this.bank.banked;
+
+    /* fx decay */
+    const fx = this.fx;
+    fx.rgb = Math.max(0, fx.rgb - dt * 60);
+    fx.zoom *= Math.pow(0.5, dt / 0.045);
+    fx.shake *= Math.pow(0.5, dt / 0.05);
+    fx.flash *= Math.pow(0.5, dt / 0.06);
+    fx.gridPulse *= Math.pow(0.5, dt / 0.12);
+
+    /* floating score popups (maturity) */
+    for (const pu of this.popups) { pu.life -= dt; pu.y -= dt * 26; }
+    for (let i = this.popups.length - 1; i >= 0; i--) {
+      if (this.popups[i].life <= 0) this.popups.splice(i, 1);
+    }
+
+    if (this.state === 'dying') {
+      if (now < this.hitstopEnd) return; /* 120ms hitstop: the world holds its breath */
+      if (!this.collapseStarted) this.startCollapse();
+      for (const r of this.rings) if (r.alive) { r.r += r.speed * dt; if (r.r > this.view.R * 2.4) r.alive = false; }
+      for (const rp of this.collapseRipples) { rp.r += rp.speed * dt; rp.alpha -= dt * 1.1; }
+      this.particles.update(dt);
+      if (now >= this.collapseEnd) this.enterResult();
+      return;
+    }
+
+    if (this.state === 'result') {
+      this.updateRequiem(now);
+      this.consumeVisuals(now);
+      /* echo rings of the requiem visualizer must bloom outward (§8) */
+      for (const r of this.rings) if (r.alive) { r.r += r.speed * dt; if (r.r > this.view.R * 2.1) r.alive = false; }
+      this.particles.update(dt);
+      for (const arr of this.field.slots) for (const n of arr) n.firedFlash = Math.max(0, n.firedFlash - dt * 3);
+      this.hue = runHue(this.result.loops, cfg);
+      return;
+    }
+
+    /* --- live states: attract / recording / playing ------------------- */
+
+    /* 1) lookahead scheduler — the skeleton. audio-time driven.          */
+    this.timeline.advanceUntil(now + cfg.LOOKAHEAD_MS / 1000, evt => this.commitStep(evt));
+    this.ghostPrepass(now);
+
+    /* 2) fixed-timestep physics (a substep may kill the run — bail out
+     *    before theremin/recording touch the freshly-dying state)       */
+    this.acc += dt;
+    const H = cfg.PHYS_DT;
+    let guard = 0;
+    while (this.acc >= H && guard++ < 32) {
+      this.acc -= H;
+      if (this.stepPhysics(H)) return;
+    }
+
+    /* 3) head + recording (16th-note sampling of the player radius) */
+    const h = this.timeline.headAt(now);
+    this.head = h;
+    this.headAngle = -Math.PI / 2 + h.phase * TAU;
+    const stepsN = cfg.STEPS_PER_REV;
+    const headLoopF = h.loop + h.phase;
+    this.runLoop = this.entryLoopF == null ? 0 : Math.floor(headLoopF - this.entryLoopF) + 1;
+
+    if (this.state === 'attract' && !this.tut.autoDone) {
+      /* first-ever visit: open the how-to-play panel once (R2-2) */
+      this.tut.autoDone = true;
+      this.tut.open = true;
+    }
+    if (this.state === 'attract' && !this.tut.open && this.inputActive && this.pointerInArena()) {
+      /* mouse entered the disc: recording starts, arm one revolution later */
+      this.state = 'recording';
+      this.timeline.decayHold = false;
+      this.entryLoopF = headLoopF;
+      this.armLoopF = headLoopF + 1;
+      this.showHint('録音中 — あなたの動きが音符になっていく');
+    }
+    if (this.state === 'recording' && headLoopF >= this.armLoopF) {
+      this.state = 'playing';           /* the title dissolves; bullets live */
+      if (this.title.active) this.dissolveTitle();
+      this.fx.gridPulse = 1;
+      this.showHint('リングは過去のあなた — 触れたら終わり');
+    }
+
+    if (this.state === 'recording' || this.state === 'playing') {
+      const stepFloat = headLoopF * stepsN;
+      if (this.prevStepFloat != null) {
+        let from = Math.floor(this.prevStepFloat) + 1;
+        const to = Math.floor(stepFloat);
+        if (to - from > stepsN) from = to - stepsN; /* hitch guard */
+        for (let k = from; k <= to; k++) {
+          this.plantAt(((k % stepsN) + stepsN) % stepsN, Math.floor(k / stepsN));
+        }
+      }
+      this.prevStepFloat = stepFloat;
+    }
+
+    /* 4) theremin follows the player's radius (the "being recorded" hum) */
+    const v = this.view, p = this.player;
+    const rn = Math.sqrt((p.x - v.cx) * (p.x - v.cx) + (p.y - v.cy) * (p.y - v.cy)) / v.R;
+    const band = bandFromRadius(rn, cfg);
+    if (this.inputActive && this.state !== 'attract') {
+      this.audio.setTheremin(pentaFreq(band, cfg.ROOT_HZ) * 2, 0.35 + 0.65 * clamp(rn, 0, 1));
+    } else if (this.inputActive && this.pointerInArena()) {
+      this.audio.setTheremin(pentaFreq(band, cfg.ROOT_HZ) * 2, 0.3);
+    } else {
+      this.audio.setTheremin(cfg.ROOT_HZ * 2, 0);
+    }
+    const heatTarget = band >= 8 ? 1 : band >= 6 ? 0.45 : 0;
+    this.outerHeat += (heatTarget - this.outerHeat) * easeFactor(0.06, dt);
+
+    /* 5) visuals & timers */
+    this.consumeVisuals(now);
+    for (const s of this.stitches) s.life -= dt;
+    for (let i = this.stitches.length - 1; i >= 0; i--) if (this.stitches[i].life <= 0) this.stitches.splice(i, 1);
+    for (const gh of this.ghosts) if (now - gh.t0 > gh.dur) gh.done = true;
+    for (let i = this.ghosts.length - 1; i >= 0; i--) if (this.ghosts[i].done) this.ghosts.splice(i, 1);
+    if (this.tut.hint && this.now > this.tut.hint.until) this.tut.hint = null;
+    for (const L of this.title.letters) L.pulse = Math.max(0, L.pulse - dt * 2.2);
+    if (this.title.dissolving) {
+      this.title.alpha = Math.max(0, this.title.alpha - dt * 1.4);
+      if (this.title.alpha <= 0) this.title.active = false;
+    }
+    for (const arr of this.field.slots) for (const n of arr) n.firedFlash = Math.max(0, n.firedFlash - dt * 3);
+    this.particles.update(dt);
+
+    /* comet trail: render trail + timed buffer for the causal ghosts */
+    p.trail.push({ x: p.x, y: p.y });
+    while (p.trail.length > cfg.TRAIL_LEN) p.trail.shift();
+    this.trailBuf.push({ x: p.x, y: p.y, t: now });
+    while (this.trailBuf.length > 200 || (this.trailBuf.length && this.trailBuf[0].t < now - 3)) {
+      this.trailBuf.shift();
+    }
+
+    /* 6) palette drift: navy -> violet -> gold as the run survives */
+    this.hue = runHue(Math.max(0, this.runLoop - 1) + (this.runLoop > 0 ? h.phase : 0), cfg);
+
+    /* 7) collision — swept per physics substep, see stepPhysics() */
+  }
+
+  /* uses the RAW pointer position (pointerIn), not the clamped target —
+   * otherwise the clamp would fake an arena entry from outside          */
+  pointerInArena() { return this.pointerIn; }
+
+  dissolveTitle() {
+    this.title.dissolving = true;
+    for (const L of this.title.letters) {
+      const p = this.notePosPx(L.step, L.band);
+      for (let i = 0; i < 5; i++) {
+        const a = cosmRand() * TAU;
+        this.particles.spawn({
+          x: p.x, y: p.y, vx: Math.cos(a) * 70, vy: Math.sin(a) * 70,
+          life: 0.9, size: 1.6, hue: 48, sat: 90, lit: 75, drag: 0.93,
+        });
+      }
+    }
+  }
+
+  render() { this.renderer.render(this); }
+
+  /* introspection for the tuner panel & headless harness */
+  debugInfo() {
+    return {
+      state: this.state,
+      runLoop: this.runLoop,
+      period: this.head ? this.head.period : 0,
+      notesAlive: this.field.count(),
+      fires: this.bank.fires,
+      matured: this.bank.matured,
+      banked: this.bank.banked,
+      pending: this.bank.pending,
+      lost: this.bank.lost,
+      ghostCueLeft: this.ghostCueLeft,
+      result: this.result,
+      audioUnlocked: this.audio.unlocked,
+    };
+  }
+}
+
+/* factory: every platform dependency arrives via env (testability) */
+function createGame(env) {
+  if (!env.createCanvas) {
+    env.createCanvas = function (w, h) {
+      const c = env.document.createElement('canvas');
+      c.width = w; c.height = h;
+      return c;
+    };
+  }
+  return new Game(env);
+}
+
+/* =====================================================================
+ * [G] Boot / DOM wiring / tuner panel / exports
+ * =================================================================== */
+
+const OSTINATO = {
+  CONFIG, applyConfigOverrides,
+  innerNorm, bandFromRadius, bandRadiusNorm, pentaFreq,
+  scorePerFire, ringSpeedFor, ringHits, runHue,
+  NoteField, Bank, StepTimeline, MusicClock,
+  AudioEngine, ParticlePool, Renderer, Game, createGame,
+};
+
+function bootBrowser() {
+  applyConfigOverrides(CONFIG, window.location.search);
+  const canvas = document.getElementById('game');
+  let storage = null;
+  try { storage = window.localStorage; } catch (e) {}
+  const game = createGame({
+    canvas,
+    document,
+    AudioCtx: window.AudioContext || window.webkitAudioContext,
+    storage,
+  });
+  window.__OSTINATO_GAME__ = game;
+
+  const resize = () => game.resize(window.innerWidth, window.innerHeight,
+    Math.max(1, Math.min(3, window.devicePixelRatio || 1)));
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* --- input ------------------------------------------------------- */
+  const local = e => {
+    const r = canvas.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+  canvas.addEventListener('pointermove', e => {
+    const p = local(e);
+    game.pointerMove(p.x, p.y, e.pointerType === 'touch');
+  });
+  canvas.addEventListener('pointerdown', e => {
+    const p = local(e);
+    game.pointerDown(p.x, p.y, e.pointerType === 'touch');
+  });
+  canvas.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+  window.addEventListener('keydown', e => {
+    if (e.code === 'KeyD' && e.shiftKey) { toggleTuner(); e.preventDefault(); return; }
+    if (e.code === 'Space' && game.paused) { game.setPaused(false); return; }
+    game.keyInput(e.code, true);
+  });
+  window.addEventListener('keyup', e => game.keyInput(e.code, false));
+
+  /* auto-pause when the window loses focus (AudioContext suspends) */
+  window.addEventListener('blur', () => { if (game.state !== 'result') game.setPaused(true); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden && game.state !== 'result') game.setPaused(true);
+  });
+
+  /* --- main loop (rAF) + scheduler safety tick (25ms, decoupled) ---- */
+  let last = (window.performance || Date).now();
+  let fps = 60, fpsAcc = 0, fpsN = 0;
+  function frame(t) {
+    const dt = Math.min(0.1, (t - last) / 1000);
+    last = t;
+    fpsAcc += dt; fpsN++;
+    if (fpsAcc >= 0.5) { fps = Math.round(fpsN / fpsAcc); fpsAcc = 0; fpsN = 0; }
+    game.update(dt);
+    game.render();
+    updateTunerStats(game, fps);
+    window.requestAnimationFrame(frame);
+  }
+  window.requestAnimationFrame(frame);
+
+  /* lookahead audio scheduler must not starve if rAF throttles:
+   * an interval tick advances the same committed timeline (idempotent) */
+  window.setInterval(() => {
+    if (game.paused) return;
+    if (game.state === 'dying') return;
+    game.clock.advance(0);
+    const horizon = game.clock.t + CONFIG.LOOKAHEAD_MS / 1000;
+    if (game.state === 'result') {
+      if (game.requiem) game.updateRequiem(game.clock.t);
+    } else {
+      game.timeline.advanceUntil(horizon, evt => game.commitStep(evt));
+    }
+  }, CONFIG.TICK_MS);
+
+  /* --- hidden tuner panel (Shift+D) --------------------------------- */
+  const tunerEl = document.getElementById('tuner');
+  let tunerBuilt = false, tunerStats = null;
+  function toggleTuner() {
+    tunerEl.hidden = !tunerEl.hidden;
+    if (!tunerEl.hidden && !tunerBuilt) { buildTuner(); tunerBuilt = true; }
+  }
+  function buildTuner() {
+    tunerEl.innerHTML = '';
+    const h = document.createElement('h3');
+    h.textContent = 'OSTINATO TUNER';
+    tunerEl.appendChild(h);
+    /* pool/array sizes and the physics step are baked in at construction;
+     * a live change desyncs them (e.g. STEPS_PER_REV > NoteField.slots
+     * length -> undefined slot -> throw in the rAF loop). URL params still
+     * apply to these — they run before construction.                     */
+    const STRUCT_KEYS = { STEPS_PER_REV: 1, MAX_RINGS: 1, MAX_PARTICLES: 1, PHYS_DT: 1 };
+    for (const k of Object.keys(CONFIG)) {
+      if (typeof CONFIG[k] !== 'number' || STRUCT_KEYS[k]) continue;
+      const row = document.createElement('div');
+      row.className = 'row';
+      const label = document.createElement('label');
+      label.textContent = k;
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.step = 'any';
+      input.value = String(CONFIG[k]);
+      input.addEventListener('change', () => {
+        const v = parseFloat(input.value);
+        if (Number.isFinite(v)) { CONFIG[k] = v; sanitizeConfig(CONFIG); }
+        input.value = String(CONFIG[k]); /* echo back the clamped value */
+      });
+      row.appendChild(label);
+      row.appendChild(input);
+      tunerEl.appendChild(row);
+    }
+    tunerStats = document.createElement('div');
+    tunerStats.className = 'stat';
+    tunerEl.appendChild(tunerStats);
+  }
+  function updateTunerStats(g, fpsNow) {
+    if (!tunerStats || tunerEl.hidden) return;
+    const d = g.debugInfo();
+    tunerStats.textContent =
+      'fps ' + fpsNow + ' | ' + d.state + ' | loop ' + d.runLoop +
+      ' | period ' + d.period.toFixed(2) + 's | notes ' + d.notesAlive +
+      ' | banked ' + d.banked + ' | pending ' + d.pending;
+  }
+}
+
+if (typeof window !== 'undefined' && window && window.document &&
+    window.document.getElementById && window.document.getElementById('game') &&
+    !window.__OSTINATO_NO_AUTOBOOT__) {
+  window.OSTINATO = OSTINATO;
+  bootBrowser();
+}
+if (typeof module !== 'undefined' && module && module.exports) {
+  module.exports = OSTINATO;
+}
+</script>
+</body>
+</html>

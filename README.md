@@ -1,4 +1,26 @@
-# ostinato
+# OSTINATO
 
-Scaffolded by infrastructure/scripts/new-project.ps1 (Valstruct Co.).
-Deploy: infrastructure/scripts/deploy.ps1 -Project <this dir>
+**あなたの回避がそのまま作曲になり、その曲が次の周回で弾幕になって襲ってくる——死んだ瞬間、あなたの一曲が完成する。**
+
+円環シーケンサー弾幕ゲーム。敵はいない。弾は全部「過去の自分」。
+
+▶ Play: https://ostinato.vercel.app/
+
+## 特徴
+
+- 単一 HTML・Vanilla JS・外部依存ゼロ（ビルド不要、`index.html` を開くだけ）
+- グラフィックは Canvas 2D 手続き生成、サウンドは WebAudio 完全合成（アセットファイル 0 個）
+- 【避けた軌跡 → メロディ → 次周の弾幕】が一対一対応。死因は 100% 自分の過去の選択
+- 死んだとき、直近 4 周分の音符が「遺曲」としてリバーブの中でループ再生される
+- 1 プレイ 1〜3 分。マウス移動だけ（クリック不要・WASD/タッチ対応）
+
+## 開発
+
+Valstruct Co.（個人 AI 組織）の旗艦デモとして、コンセプト・トーナメント（8案×5審査員）→ 実装 → 多エージェント敵対的レビュー×ポリッシュのパイプラインで制作。
+
+## テスト
+
+```
+node test/smoke.js         # ヘッドレス全ゲームループ（80 assert・120秒耐久）
+node test/ks-stability.js  # 音声合成フィードバックループの安定性の数値証明
+```
