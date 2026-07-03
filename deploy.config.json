@@ -1,0 +1,6 @@
+{
+  "_note": "Fill productionUrl and previewUrlTemplate after importing this repo into Vercel (dashboard OAuth). {branch} is replaced with the pushed branch name. Leave a URL blank to skip the health check.",
+  "productionBranch": "main",
+  "productionUrl": "",
+  "previewUrlTemplate": ""
+}
